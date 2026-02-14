@@ -1,14 +1,15 @@
+import datetime
 import logging
 from io import BytesIO
 from typing import Any, Protocol
 
-import pdfplumber
 from fastapi import UploadFile
 from nanoid import generate as generate_nanoid
 from sqlalchemy import Integer, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import schemas
+from src.config import settings
 from src.exceptions import FileProcessingError, UnsupportedFileTypeError
 from src.schemas import Message
 
@@ -25,6 +26,8 @@ class PDFProcessor:
         return content_type == "application/pdf"
 
     async def extract_text(self, content: bytes) -> str:
+        import pdfplumber
+
         with pdfplumber.open(BytesIO(content)) as pdf_reader:
             text_parts: list[str] = []
             for page_num, page in enumerate(pdf_reader.pages):
@@ -157,7 +160,10 @@ async def get_file_messages(
 async def process_file_uploads_for_messages(
     file: UploadFile,
     peer_id: str,
-    max_chars: int = 49500,
+    max_chars: int = settings.MAX_MESSAGE_SIZE,
+    metadata: dict[str, Any] | None = None,
+    configuration: schemas.MessageConfiguration | None = None,
+    created_at: datetime.datetime | None = None,
 ) -> list[dict[str, Any]]:
     """
     Process an uploaded file and prepare message creation data.
@@ -169,6 +175,9 @@ async def process_file_uploads_for_messages(
         file: Uploaded file to process
         peer_id: ID of the peer creating the messages
         max_chars: Maximum characters per message chunk
+        metadata: Optional metadata to associate with all messages created from this file
+        configuration: Optional configuration to associate with all messages created from this file
+        created_at: Optional created_at timestamp to use for all messages created from this file
 
     Returns:
         List of dictionaries containing message_create and file_metadata
@@ -191,10 +200,13 @@ async def process_file_uploads_for_messages(
         # Build message content properly handling empty files
         message_content = chunk or ""
 
-        # Create message
+        # Create message with optional metadata, configuration, and created_at
         message_create = schemas.MessageCreate(
             content=message_content,
             peer_id=peer_id,
+            metadata=metadata,
+            configuration=configuration,
+            created_at=created_at,
         )
 
         # Store file metadata separately to add to internal_metadata later

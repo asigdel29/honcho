@@ -3,12 +3,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import models
-from src.deriver.utils import get_work_unit_key
+from src.utils.work_unit import construct_work_unit_key
 
 
 @pytest.mark.asyncio
 class TestDeriverStatusEndpoint:
-    """Test suite for the /deriver/status endpoint"""
+    """Test suite for the /queue/status endpoint"""
 
     async def test_get_deriver_status_peer_only(
         self,
@@ -18,7 +18,7 @@ class TestDeriverStatusEndpoint:
         """Test getting deriver status filtered by peer only"""
         workspace, peer = sample_data
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name},
         )
         assert response.status_code == 200
@@ -36,7 +36,7 @@ class TestDeriverStatusEndpoint:
         db_session.add(session)
         await db_session.commit()
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"session_id": session.name},
         )
         assert response.status_code == 200
@@ -54,7 +54,7 @@ class TestDeriverStatusEndpoint:
         db_session.add(session)
         await db_session.commit()
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name, "session_id": session.name},
         )
         assert response.status_code == 200
@@ -68,7 +68,7 @@ class TestDeriverStatusEndpoint:
         """Test getting deriver status with include_sender=True"""
         workspace, peer = sample_data
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name, "sender_id": peer.name},
         )
         assert response.status_code == 200
@@ -82,7 +82,7 @@ class TestDeriverStatusEndpoint:
         """Test getting deriver status with include_sender=False (default)"""
         workspace, peer = sample_data
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name},
         )
         assert response.status_code == 200
@@ -93,7 +93,7 @@ class TestDeriverStatusEndpoint:
     ):
         """Test getting deriver status without required parameters returns 200"""
         workspace, _ = sample_data
-        response = client.get(f"/v2/workspaces/{workspace.name}/deriver/status")
+        response = client.get(f"/v3/workspaces/{workspace.name}/queue/status")
         assert response.status_code == 200
 
     async def test_get_deriver_status_nonexistent_peer(
@@ -102,7 +102,7 @@ class TestDeriverStatusEndpoint:
         """Test getting deriver status for nonexistent peer returns empty result"""
         workspace, _ = sample_data
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": "nonexistent"},
         )
         assert response.status_code == 200
@@ -117,7 +117,7 @@ class TestDeriverStatusEndpoint:
         """Test getting deriver status for nonexistent session returns empty result"""
         workspace, _ = sample_data
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"session_id": "nonexistent"},
         )
         assert response.status_code == 200
@@ -128,7 +128,7 @@ class TestDeriverStatusEndpoint:
 
     async def test_get_deriver_status_nonexistent_workspace(self, client: TestClient):
         """Test getting deriver status for nonexistent workspace returns empty result"""
-        response = client.get("/v2/workspaces/nonexistent/deriver/status")
+        response = client.get("/v3/workspaces/nonexistent/queue/status")
         assert response.status_code == 200
         assert response.json()["total_work_units"] == 0
 
@@ -148,8 +148,8 @@ class TestDeriverStatusEndpoint:
         queue_items: list[models.QueueItem] = []
         for _ in range(5):
             payload = {
-                "sender_name": peer.name,
-                "target_name": peer.name,
+                "observed": peer.name,
+                "observer": peer.name,
                 "task_type": "representation",
                 "workspace_name": workspace.name,
                 "session_name": session.name,
@@ -157,21 +157,22 @@ class TestDeriverStatusEndpoint:
             queue_item = models.QueueItem(
                 session_id=session.id,
                 task_type="representation",
-                work_unit_key=get_work_unit_key("representation", payload),
+                work_unit_key=construct_work_unit_key(workspace.name, payload),
                 payload=payload,
                 processed=False,
+                workspace_name=workspace.name,
             )
             queue_items.append(queue_item)
         db_session.add_all(queue_items)
         await db_session.commit()
         # Test without parameters
-        response = client.get(f"/v2/workspaces/{workspace.name}/deriver/status")
+        response = client.get(f"/v3/workspaces/{workspace.name}/queue/status")
         assert response.status_code == 200
         assert response.json()["total_work_units"] == 5
         assert response.json()["pending_work_units"] == 5
         # Test with observer_id
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name},
         )
         assert response.status_code == 200
@@ -179,7 +180,7 @@ class TestDeriverStatusEndpoint:
         assert response.json()["pending_work_units"] == 5
         # Test with sender_id (new capability)
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"sender_id": peer.name},
         )
         assert response.status_code == 200
@@ -187,7 +188,7 @@ class TestDeriverStatusEndpoint:
         assert response.json()["pending_work_units"] == 5
         # Test with both (OR filter)
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name, "sender_id": peer.name},
         )
         assert response.status_code == 200
@@ -195,7 +196,7 @@ class TestDeriverStatusEndpoint:
         assert response.json()["pending_work_units"] == 5
         # Test with different observer and sender (should be ok)
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name, "sender_id": "different"},
         )
         assert response.status_code == 200
@@ -222,8 +223,8 @@ class TestDeriverStatusEndpoint:
             queue_items: list[models.QueueItem] = []
             for _ in range(i + 1):  # 1,2,3 items respectively
                 payload = {
-                    "sender_name": peer.name,
-                    "target_name": peer.name,
+                    "observed": peer.name,
+                    "observer": peer.name,
                     "task_type": "representation",
                     "workspace_name": workspace.name,
                     "session_name": session.name,
@@ -231,15 +232,16 @@ class TestDeriverStatusEndpoint:
                 queue_item = models.QueueItem(
                     session_id=session.id,
                     task_type="representation",
-                    work_unit_key=get_work_unit_key("representation", payload),
+                    work_unit_key=construct_work_unit_key(workspace.name, payload),
                     payload=payload,
                     processed=False,
+                    workspace_name=workspace.name,
                 )
                 queue_items.append(queue_item)
             db_session.add_all(queue_items)
         await db_session.commit()
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={"observer_id": peer.name},
         )
         assert response.status_code == 200
@@ -260,7 +262,7 @@ class TestDeriverStatusEndpoint:
         """Test various edge cases with empty or invalid parameters"""
         workspace, _ = sample_data
         response = client.get(
-            f"/v2/workspaces/{workspace.name}/deriver/status",
+            f"/v3/workspaces/{workspace.name}/queue/status",
             params={
                 "observer_id": "",
                 "session_id": "",
@@ -283,8 +285,8 @@ class TestDeriverStatusEndpoint:
         await db_session.commit()
         await db_session.refresh(session)
         payload = {
-            "sender_name": peer.name,
-            "target_name": peer.name,
+            "observed": peer.name,
+            "observer": peer.name,
             "task_type": "representation",
             "workspace_name": workspace.name,
             "session_name": session.name,
@@ -292,9 +294,10 @@ class TestDeriverStatusEndpoint:
         queue_item = models.QueueItem(
             session_id=session.id,
             task_type="representation",
-            work_unit_key=get_work_unit_key("representation", payload),
+            work_unit_key=construct_work_unit_key(workspace.name, payload),
             payload=payload,
             processed=False,
+            workspace_name=workspace.name,
         )
         db_session.add(queue_item)
         await db_session.commit()
@@ -302,7 +305,7 @@ class TestDeriverStatusEndpoint:
         responses = []
         for _ in range(3):
             response = client.get(
-                f"/v2/workspaces/{workspace.name}/deriver/status",
+                f"/v3/workspaces/{workspace.name}/queue/status",
                 params={"observer_id": peer.name},
             )
             assert response.status_code == 200

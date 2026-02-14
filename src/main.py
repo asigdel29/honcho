@@ -7,19 +7,20 @@ from typing import TYPE_CHECKING
 
 import sentry_sdk
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi_pagination import add_pagination
-
-if TYPE_CHECKING:
-    from sentry_sdk._types import Event, Hint
+from pydantic import ValidationError
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 
+from src.cache.client import close_cache, init_cache
 from src.config import settings
 from src.db import engine, request_context
 from src.exceptions import HonchoException
 from src.routers import (
+    conclusions,
     keys,
     messages,
     peers,
@@ -27,7 +28,17 @@ from src.routers import (
     webhooks,
     workspaces,
 )
-from src.security import create_admin_jwt
+from src.telemetry import (
+    initialize_telemetry_async,
+    metrics_endpoint,
+    prometheus_metrics,
+    shutdown_telemetry,
+)
+from src.telemetry.logging import get_route_template
+from src.telemetry.sentry import initialize_sentry
+
+if TYPE_CHECKING:
+    from sentry_sdk._types import Event, Hint
 
 
 def get_log_level() -> int:
@@ -58,37 +69,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress cashews Redis error logs (NoScriptError, ConnectionError, etc.)
+# These are handled gracefully by SafeRedis and don't need full tracebacks
+logging.getLogger("cashews.backends.redis.client").setLevel(logging.CRITICAL)
 
-# JWT Setup
-async def setup_admin_jwt():
-    token = create_admin_jwt()
-    print(f"\n    ADMIN JWT: {token}\n")
+
+def before_send(event: "Event", hint: "Hint | None") -> "Event | None":
+    """Filter out events raised from known non-actionable exceptions before Sentry sees them."""
+    if not hint:
+        return event
+
+    exc_info = hint.get("exc_info")
+    if not exc_info:
+        return event
+
+    _, exc_value, _ = exc_info
+    if isinstance(exc_value, HonchoException):
+        return None
+
+    # Filters out ValidationErrors and RequestValidationErrors (typically coming from Pydantic)
+    if isinstance(exc_value, ValidationError | RequestValidationError):
+        logger.info(f"Filtering out validation error from Sentry: {exc_value}")
+        return None
+
+    return event
 
 
 # Sentry Setup
 SENTRY_ENABLED = settings.SENTRY.ENABLED
 if SENTRY_ENABLED:
-
-    def before_send(event: "Event", hint: "Hint") -> "Event | None":
-        if "exc_info" in hint:
-            _, exc_value, _ = hint["exc_info"]
-            # Filter out HonchoExceptions from being sent to Sentry
-            if isinstance(exc_value, HonchoException):
-                return None
-
-        return event
-
-    # Sentry SDK's default behavior:
-    # - Captures INFO+ level logs as breadcrumbs
-    # - Captures ERROR+ level logs as Sentry events
-    #
-    # For custom log levels, use the LoggingIntegration class:
-    # sentry_sdk.init(..., integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)])
-    sentry_sdk.init(
-        dsn=settings.SENTRY.DSN,
-        traces_sample_rate=settings.SENTRY.TRACES_SAMPLE_RATE,
-        profiles_sample_rate=settings.SENTRY.PROFILES_SAMPLE_RATE,
-        before_send=before_send,
+    initialize_sentry(
         integrations=[
             StarletteIntegration(
                 transaction_style="endpoint",
@@ -97,27 +107,45 @@ if SENTRY_ENABLED:
                 transaction_style="endpoint",
             ),
         ],
+        before_send=before_send,
     )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Lifespan events are now handled by the respective services
-    yield
-    await engine.dispose()
+    # Initialize CloudEvents telemetry
+    await initialize_telemetry_async()
+
+    try:
+        await init_cache()
+    except Exception as e:
+        logger.warning(
+            "Error initializing cache in api process; proceeding without cache: %s", e
+        )
+
+    try:
+        yield
+    finally:
+        # Import here to avoid circular import at module load time
+        from src.vector_store import close_external_vector_store
+
+        await close_external_vector_store()
+        await close_cache()
+        await engine.dispose()
+        # Shutdown telemetry (flush CloudEvents buffer)
+        await shutdown_telemetry()
 
 
 app = FastAPI(
     lifespan=lifespan,
     servers=[
-        {"url": "http://localhost:8000", "description": "Local Development Server"},
-        {"url": "https://demo.honcho.dev", "description": "Demo Server"},
         {"url": "https://api.honcho.dev", "description": "Production SaaS Platform"},
+        {"url": "http://localhost:8000", "description": "Local Development Server"},
     ],
     title="Honcho API",
     summary="The Identity Layer for the Agentic World",
-    description="""Honcho is a platform for giving agents user-centric memory and social cognition""",
-    version="2.3.0",
+    description="""Honcho is a platform for giving agents user-centric memory and social cognition.""",
+    version="3.0.2",
     contact={
         "name": "Plastic Labs",
         "url": "https://honcho.dev",
@@ -133,7 +161,6 @@ app = FastAPI(
 origins = [
     "http://localhost",
     "http://127.0.0.1:8000",
-    "https://demo.honcho.dev",
     "https://api.honcho.dev",
 ]
 
@@ -145,14 +172,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 add_pagination(app)
 
-app.include_router(workspaces.router, prefix="/v2")
-app.include_router(peers.router, prefix="/v2")
-app.include_router(sessions.router, prefix="/v2")
-app.include_router(messages.router, prefix="/v2")
-app.include_router(keys.router, prefix="/v2")
-app.include_router(webhooks.router, prefix="/v2")
+app.include_router(workspaces.router, prefix="/v3")
+app.include_router(peers.router, prefix="/v3")
+app.include_router(sessions.router, prefix="/v3")
+app.include_router(messages.router, prefix="/v3")
+app.include_router(conclusions.router, prefix="/v3")
+app.include_router(keys.router, prefix="/v3")
+app.include_router(webhooks.router, prefix="/v3")
+
+# Prometheus metrics endpoint
+app.add_route("/metrics", metrics_endpoint, methods=["GET"])
 
 
 # Global exception handlers
@@ -160,6 +192,7 @@ app.include_router(webhooks.router, prefix="/v2")
 async def honcho_exception_handler(_request: Request, exc: HonchoException):
     """Handle all Honcho-specific exceptions."""
     logger.error(f"{exc.__class__.__name__}: {exc.detail}", exc_info=exc)
+
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
@@ -170,6 +203,7 @@ async def honcho_exception_handler(_request: Request, exc: HonchoException):
 async def global_exception_handler(_request: Request, exc: Exception):
     """Handle all unhandled exceptions."""
     logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+
     if SENTRY_ENABLED:
         sentry_sdk.capture_exception(exc)
     return JSONResponse(
@@ -191,6 +225,17 @@ async def track_request(
     token = request_context.set(f"api:{request_id}")
 
     try:
-        return await call_next(request)
+        response = await call_next(request)
+
+        # Track metrics if enabled
+        if settings.METRICS.ENABLED:
+            template = get_route_template(request)
+            prometheus_metrics.record_api_request(
+                method=request.method,
+                endpoint=template,
+                status_code=str(response.status_code),
+            )
+
+        return response
     finally:
         request_context.reset(token)

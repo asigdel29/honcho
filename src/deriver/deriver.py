@@ -1,629 +1,252 @@
-import datetime
-import json
 import logging
 import time
-from typing import Any
 
-import sentry_sdk
-from langfuse.decorators import langfuse_context
-
-from src import crud, exceptions
+from src import crud
 from src.config import settings
-from src.crud.representation import GLOBAL_REPRESENTATION_COLLECTION_NAME
+from src.crud.representation import RepresentationManager
 from src.dependencies import tracked_db
-from src.utils import summarizer
+from src.models import Message
+from src.schemas import ResolvedConfiguration
+from src.telemetry import prometheus_metrics
+from src.telemetry.events import RepresentationCompletedEvent, emit
+from src.telemetry.logging import accumulate_metric, log_performance_metrics
+from src.telemetry.prometheus.metrics import (
+    DeriverComponents,
+    DeriverTaskTypes,
+    TokenTypes,
+)
+from src.telemetry.sentry import with_sentry_transaction
 from src.utils.clients import honcho_llm_call
-from src.utils.embedding_store import EmbeddingStore
-from src.utils.formatting import (
-    REASONING_LEVELS,
-    extract_observation_content,
-    find_new_observations,
-    format_context_for_prompt,
-    format_new_turn_with_timestamp,
-    utc_now_iso,
-)
-from src.utils.logging import (
-    accumulate_metric,
-    conditional_observe,
-    format_reasoning_inputs_as_markdown,
-    format_reasoning_response_as_markdown,
-    log_observations_tree,
-    log_performance_metrics,
-    log_thinking_panel,
-)
-from src.utils.shared_models import (
-    DeductiveObservation,
-    ObservationContext,
-    PeerCardQuery,
-    ReasoningResponse,
-    ReasoningResponseWithThinking,
-    UnifiedObservation,
-)
+from src.utils.config_helpers import get_configuration
+from src.utils.formatting import format_new_turn_with_timestamp
+from src.utils.representation import PromptRepresentation, Representation
+from src.utils.tokens import track_deriver_input_tokens
 
-from .prompts import critical_analysis_prompt, peer_card_prompt
-from .queue_payload import (
-    RepresentationPayload,
-)
+from .prompts import estimate_minimal_deriver_prompt_tokens, minimal_deriver_prompt
 
 logger = logging.getLogger(__name__)
-logging.getLogger("sqlalchemy.engine.Engine").disabled = True
 
 
-@honcho_llm_call(
-    provider=settings.DERIVER.PROVIDER,
-    model=settings.DERIVER.MODEL,
-    track_name="Critical Analysis Call",
-    response_model=ReasoningResponse,
-    json_mode=True,
-    max_tokens=settings.DERIVER.MAX_OUTPUT_TOKENS or settings.LLM.DEFAULT_MAX_TOKENS,
-    thinking_budget_tokens=settings.DERIVER.THINKING_BUDGET_TOKENS
-    if settings.DERIVER.PROVIDER == "anthropic"
-    else None,
-    enable_retry=True,
-    retry_attempts=3,
-)
-async def critical_analysis_call(
-    peer_id: str,
-    peer_card: list[str] | None,
-    message_created_at: datetime.datetime,
-    working_representation: str | None,
-    history: str,
-    new_turn: str,
-):
-    return critical_analysis_prompt(
-        peer_id=peer_id,
-        peer_card=peer_card,
-        message_created_at=message_created_at,
-        working_representation=working_representation,
-        history=history,
-        new_turn=new_turn,
-    )
-
-
-@honcho_llm_call(
-    provider=settings.DERIVER.PEER_CARD_PROVIDER,
-    model=settings.DERIVER.PEER_CARD_MODEL,
-    track_name="Peer Card Call",
-    response_model=PeerCardQuery,
-    json_mode=True,
-    max_tokens=settings.DERIVER.PEER_CARD_MAX_OUTPUT_TOKENS
-    or settings.LLM.DEFAULT_MAX_TOKENS,
-    reasoning_effort="minimal",
-    enable_retry=True,
-    retry_attempts=1,  # unstructured output means we shouldn't need to retry, 1 just in case
-)
-async def peer_card_call(
-    old_peer_card: list[str] | None,
-    new_observations: list[str],
-):
-    return peer_card_prompt(
-        old_peer_card=old_peer_card,
-        new_observations=new_observations,
-    )
-
-
-@conditional_observe
-@sentry_sdk.trace
-async def process_representation_task(
-    payload: RepresentationPayload,
+@with_sentry_transaction("minimal_deriver_batch", op="deriver")
+async def process_representation_tasks_batch(
+    messages: list[Message],
+    message_level_configuration: ResolvedConfiguration | None,
+    *,
+    observers: list[str],
+    observed: str,
+    queue_item_message_ids: list[int],
 ) -> None:
     """
-    Process a representation task by extracting insights and updating working representations.
+    Process messages with minimal overhead - single LLM call, save to multiple collections.
+
+    Args:
+        messages: List of messages to process (includes interleaving context).
+        message_level_configuration: Optional configuration override.
+        observers: List of observer peer IDs (collections to save to).
+        observed: The observed peer ID.
+        queue_item_message_ids: Message IDs from queue items being processed
     """
-    # Start overall timing
+    if not messages:
+        return
+
     overall_start = time.perf_counter()
 
-    logger.debug("Starting insight extraction for user message: %s", payload.message_id)
+    messages.sort(key=lambda x: x.id)
+    latest_message = messages[-1]
+    earliest_message = messages[0]
 
-    # Use get_session_context_formatted with configurable token limit
-    async with tracked_db("deriver.get_session_context") as db:
-        formatted_history = await summarizer.get_session_context_formatted(
-            db,
-            payload.workspace_name,
-            payload.session_name,
-            token_limit=settings.DERIVER.CONTEXT_TOKEN_LIMIT,
-            cutoff=payload.message_id,
-            include_summary=True,
-        )
-
-    # instantiate embedding store from collection
-    # if the sender is also the target, we're handling a global representation task.
-    # otherwise, we're handling a directional representation task where the sender is
-    # being observed by the target.
-    collection_name = (
-        crud.construct_collection_name(
-            observer=payload.target_name, observed=payload.sender_name
-        )
-        if payload.sender_name != payload.target_name
-        else GLOBAL_REPRESENTATION_COLLECTION_NAME
-    )
-
-    # get_or_create_collection already handles IntegrityError with rollback and a retry
-    async with tracked_db("deriver.get_or_create_collection") as db:
-        collection = await crud.get_or_create_collection(
-            db,
-            payload.workspace_name,
-            collection_name,
-            payload.sender_name,
-        )
-        collection_name_loaded = collection.name
-
-    # Use the embedding store directly
-    embedding_store = EmbeddingStore(
-        workspace_name=payload.workspace_name,
-        peer_name=payload.sender_name,
-        collection_name=collection_name_loaded,
-    )
-
-    # Create reasoner instance
-    reasoner = CertaintyReasoner(embedding_store=embedding_store, ctx=payload)
-
-    # Check for existing working representation first, fall back to global search
-    async with tracked_db("deriver.get_working_representation_data") as db:
-        working_rep_data: (
-            dict[str, Any] | str | None
-        ) = await crud.get_working_representation_data(
-            db,
-            payload.workspace_name,
-            payload.target_name,
-            payload.sender_name,
-            payload.session_name,
-        )
-
-    # Time context preparation
-    context_prep_start = time.perf_counter()
-    if (
-        working_rep_data
-        and isinstance(working_rep_data, dict)
-        and working_rep_data.get("final_observations")
-    ):
-        # Reconstruct ReasoningResponse from stored peer data
-        final_obs: dict[str, Any] = working_rep_data["final_observations"]
-        deductive_observations: list[DeductiveObservation] = []
-        for deductive_data in final_obs.get("deductive", []):
-            deductive_observations.append(
-                DeductiveObservation(
-                    conclusion=deductive_data["conclusion"],
-                    premises=deductive_data.get("premises", []),
-                )
+    # Get configuration if not provided
+    # TODO: this appears to be a very rare edge case coming out of `get_queue_item_batch` in queue_manager.py,
+    # possible that we can remove this and require configuration to come through with the payload.
+    if message_level_configuration is None:
+        async with tracked_db("minimal_deriver.get_config") as db:
+            message_level_configuration = get_configuration(
+                None,
+                await crud.get_session(
+                    db, latest_message.session_name, latest_message.workspace_name
+                ),
+                await crud.get_workspace(
+                    db, workspace_name=latest_message.workspace_name
+                ),
             )
 
-        working_representation = ReasoningResponseWithThinking(
-            thinking=final_obs.get("thinking"),
-            explicit=final_obs.get("explicit", []),
-            deductive=deductive_observations,
-        )
-        logger.info(
-            "Using existing working representation with %s explicit, %s deductive observations",
-            len(working_representation.explicit),
-            len(working_representation.deductive),
-        )
-    else:
-        # No existing working representation, use global search
-        working_representation = await embedding_store.get_relevant_observations(
-            query=payload.content,
-            conversation_context=formatted_history,
-            for_reasoning=True,
-        )
+    # Skip if disabled
+    if message_level_configuration.reasoning.enabled is False:
+        return
 
-        working_representation = observation_context_to_reasoning_response(
-            working_representation
-        )
-        logger.info("No working representation found, using global semantic search")
-    context_prep_duration = (time.perf_counter() - context_prep_start) * 1000
     accumulate_metric(
-        f"deriver_representation_{payload.message_id}_{payload.target_name}",
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        "starting_message_id",
+        earliest_message.id,
+        "id",
+    )
+    accumulate_metric(
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        "ending_message_id",
+        latest_message.id,
+        "id",
+    )
+
+    # Format messages with timestamps
+    formatted_messages = "\n".join(
+        format_new_turn_with_timestamp(msg.content, msg.created_at, msg.peer_name)
+        for msg in messages
+    )
+
+    # Track token usage - count only tokens from messages being processed
+    prompt_tokens = estimate_minimal_deriver_prompt_tokens()
+    queue_item_message_ids_set = set(queue_item_message_ids)
+    messages_tokens = sum(
+        msg.token_count for msg in messages if msg.id in queue_item_message_ids_set
+    )
+    track_deriver_input_tokens(
+        task_type=DeriverTaskTypes.INGESTION,
+        components={
+            DeriverComponents.PROMPT: prompt_tokens,
+            DeriverComponents.MESSAGES: messages_tokens,
+        },
+    )
+
+    # Build prompt
+    prompt = minimal_deriver_prompt(peer_id=observed, messages=formatted_messages)
+
+    context_prep_duration = (time.perf_counter() - overall_start) * 1000
+    accumulate_metric(
+        f"minimal_deriver_{latest_message.id}_{observed}",
         "context_preparation",
         context_prep_duration,
         "ms",
     )
 
-    # Run consolidated reasoning that handles explicit and deductive levels
-    logger.debug(
-        "REASONING: Running unified insight derivation across explicit and deductive reasoning levels"
+    # validation on settings means max_tokens will always be > 0
+    max_tokens = settings.DERIVER.MAX_OUTPUT_TOKENS or settings.LLM.DEFAULT_MAX_TOKENS
+
+    # Single LLM call
+    llm_start = time.perf_counter()
+    response = await honcho_llm_call(
+        llm_settings=settings.DERIVER,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        track_name="Minimal Deriver",
+        response_model=PromptRepresentation,
+        json_mode=True,
+        temperature=settings.DERIVER.TEMPERATURE,
+        stop_seqs=["   \n", "\n\n\n\n"],
+        thinking_budget_tokens=settings.DERIVER.THINKING_BUDGET_TOKENS,
+        max_input_tokens=settings.DERIVER.MAX_INPUT_TOKENS,
+        reasoning_effort="minimal",
+        enable_retry=True,
+        retry_attempts=3,
+        trace_name="minimal_deriver",
+    )
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+
+    accumulate_metric(
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        "llm_call_duration",
+        llm_duration,
+        "ms",
     )
 
-    # We currently only use Peer Cards in Honcho-level representation derivation.
-    if payload.sender_name == payload.target_name:
-        async with tracked_db("deriver.get_peer_card") as db:
-            sender_peer_card: list[str] | None = await crud.get_peer_card(
-                db, payload.workspace_name, payload.sender_name
-            )
-        if sender_peer_card is None:
-            logger.warning("No peer card found for %s", payload.sender_name)
-        else:
-            logger.info("Using peer card: %s", sender_peer_card)
+    # Prometheus metrics
+    if settings.METRICS.ENABLED:
+        prometheus_metrics.record_deriver_tokens(
+            count=response.output_tokens,
+            task_type=DeriverTaskTypes.INGESTION.value,
+            token_type=TokenTypes.OUTPUT.value,
+            component=DeriverComponents.OUTPUT_TOTAL.value,
+        )
+
+    message_ids = [m.id for m in messages if m.peer_name == observed]
+
+    # Convert to Representation and save
+    observations = Representation.from_prompt_representation(
+        response.content,
+        message_ids,
+        latest_message.session_name,
+        latest_message.created_at,
+    )
+
+    if observations.is_empty() or not message_ids:
+        logger.warning(
+            "Deriver generated zero observations for messages %s:%s in %s/%s!",
+            earliest_message.id,
+            latest_message.id,
+            latest_message.workspace_name,
+            latest_message.session_name,
+        )
     else:
-        logger.info("No peer card used for directional representation derivation")
-        sender_peer_card = None
+        # Save to all observer collections
+        for observer in observers:
+            representation_manager = RepresentationManager(
+                workspace_name=latest_message.workspace_name,
+                observer=observer,
+                observed=observed,
+            )
 
-    # Run single-pass reasoning
-    final_observations = await reasoner.reason(
-        working_representation,
-        formatted_history,
-        sender_peer_card,
-    )
+            try:
+                await representation_manager.save_representation(
+                    observations,
+                    message_ids,
+                    latest_message.session_name,
+                    latest_message.created_at,
+                    message_level_configuration,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to save representation for observer %s: %s", observer, e
+                )
 
-    logger.debug("REASONING COMPLETION: Unified reasoning completed across all levels.")
-
-    # Display final observations in a beautiful tree
-    final_obs_dict = {
-        level: getattr(final_observations, level, []) for level in REASONING_LEVELS
-    }
-    log_observations_tree(final_obs_dict)
-
-    # Always save working representation to peer for dialectic access
-    await save_working_representation_to_peer(payload, final_observations)
-
-    # Calculate and log overall timing
+    # Log metrics
     overall_duration = (time.perf_counter() - overall_start) * 1000
     accumulate_metric(
-        f"deriver_representation_{payload.message_id}_{payload.target_name}",
+        f"minimal_deriver_{latest_message.id}_{observed}",
         "total_processing_time",
         overall_duration,
         "ms",
     )
 
-    total_observations = sum(len(obs_list) for obs_list in final_obs_dict.values())
-
+    total_observations = len(observations.explicit) + len(observations.deductive)
     accumulate_metric(
-        f"deriver_representation_{payload.message_id}_{payload.target_name}",
-        "final_observation_count",
+        f"minimal_deriver_{latest_message.id}_{observed}",
+        "observation_count",
         total_observations,
-        "",
-    )
-    log_performance_metrics(
-        f"deriver_representation_{payload.message_id}_{payload.target_name}"
+        "count",
     )
 
-    if settings.LANGFUSE_PUBLIC_KEY:
-        langfuse_context.update_current_trace(
-            output=format_reasoning_response_as_markdown(final_observations)
-        )
-
-
-class CertaintyReasoner:
-    """Certainty reasoner for analyzing and deriving insights."""
-
-    embedding_store: EmbeddingStore
-    ctx: RepresentationPayload
-
-    def __init__(
-        self, embedding_store: EmbeddingStore, ctx: RepresentationPayload
-    ) -> None:
-        self.embedding_store = embedding_store
-        self.ctx = ctx
-
-    @conditional_observe
-    @sentry_sdk.trace
-    async def derive_new_insights(
-        self,
-        working_representation: ReasoningResponseWithThinking,
-        history: str,
-        speaker_peer_card: list[str] | None,
-    ) -> ReasoningResponseWithThinking:
-        """
-        Critically analyzes and revises understanding, returning structured observations.
-        """
-
-        if settings.LANGFUSE_PUBLIC_KEY:
-            langfuse_context.update_current_observation(
-                input=format_reasoning_inputs_as_markdown(
-                    working_representation,
-                    history,
-                    self.ctx.content,
-                    self.ctx.created_at,
-                )
-            )
-
-        formatted_new_turn = format_new_turn_with_timestamp(
-            self.ctx.content,
-            self.ctx.created_at,
-            self.ctx.sender_name,
-        )
-        formatted_working_representation = format_context_for_prompt(
-            working_representation
-        )
-
-        logger.debug(
-            "CRITICAL ANALYSIS: message_created_at='%s', formatted_new_turn='%s'",
-            self.ctx.created_at,
-            formatted_new_turn,
-        )
-
-        try:
-            response_obj = await critical_analysis_call(
-                peer_id=self.ctx.sender_name,
-                peer_card=speaker_peer_card,
-                message_created_at=self.ctx.created_at,
-                working_representation=formatted_working_representation,
-                history=history,
-                new_turn=formatted_new_turn,
-            )
-        except Exception as e:
-            raise exceptions.LLMError(
-                speaker_peer_card=speaker_peer_card,
-                working_representation=formatted_working_representation,
-                history=history,
-                new_turn=formatted_new_turn,
-            ) from e
-
-        # If response is a string, try to parse as JSON
-        if isinstance(response_obj, str):
-            try:
-                response_data = json.loads(response_obj)
-                new_insights = ReasoningResponse(
-                    explicit=response_data.get("explicit", []),
-                    deductive=[
-                        DeductiveObservation(**item)
-                        for item in response_data.get("deductive", [])
-                    ],
-                )
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                if settings.SENTRY.ENABLED:
-                    sentry_sdk.capture_exception(e)
-                logger.warning("Failed to parse string response as JSON: %s", e)
-                new_insights = ReasoningResponse(explicit=[], deductive=[])
-        else:
-            # If response is already a ReasoningResponse object
-            new_insights = response_obj
-
-        # Extract thinking content from the response
-        thinking: str | None = None
-        try:
-            # Try to get thinking from the response object using getattr for safety
-            response_attr = getattr(response_obj, "_response", None)
-            if response_attr:
-                thinking = getattr(response_attr, "thinking", None)
-            else:
-                thinking = getattr(response_obj, "thinking", None)
-
-            if thinking is None:
-                logger.debug("No thinking content found in response")
-        except (AttributeError, TypeError) as e:
-            logger.warning("Error accessing thinking content: %s, setting to None", e)
-            thinking = None
-
-        response = ReasoningResponseWithThinking(
-            thinking=thinking,
-            explicit=new_insights.explicit,
-            deductive=new_insights.deductive,
-        )
-
-        logger.debug(
-            "🚀 DEBUG: new_insights=%s, thinking_length=%s",
-            new_insights,
-            len(thinking) if thinking else 0,
-        )
-
-        if settings.LANGFUSE_PUBLIC_KEY:
-            langfuse_context.update_current_observation(
-                output=format_reasoning_response_as_markdown(response),
-            )
-
-        return response
-
-    @conditional_observe
-    @sentry_sdk.trace
-    async def reason(
-        self,
-        working_representation: ReasoningResponseWithThinking,
-        history: str,
-        speaker_peer_card: list[str] | None,
-    ) -> ReasoningResponseWithThinking:
-        """
-        Single-pass reasoning function that critically analyzes and derives insights.
-        Performs one analysis pass and returns the final observations.
-        """
-        analysis_start = time.perf_counter()
-
-        # Perform critical analysis to get observation lists
-        reasoning_response = await self.derive_new_insights(
-            working_representation,
-            history,
-            speaker_peer_card,
-        )
-
-        # Output the thinking content for this analysis
-        log_thinking_panel(reasoning_response.thinking)
-
-        analysis_duration_ms = (time.perf_counter() - analysis_start) * 1000
+    if settings.DERIVER.LOG_OBSERVATIONS:
+        # Log messages fed into deriver
         accumulate_metric(
-            f"deriver_representation_{self.ctx.message_id}_{self.ctx.target_name}",
-            "critical_analysis_duration",
-            analysis_duration_ms,
-            "ms",
+            f"minimal_deriver_{latest_message.id}_{observed}",
+            "messages",
+            formatted_messages,
+            "blob",
         )
-
-        save_observations_start = time.perf_counter()
-        # Save only the NEW observations that weren't in the original context
-        new_observations_by_level: dict[
-            str, list[str]
-        ] = await self._save_new_observations(
-            working_representation, reasoning_response
-        )
-        save_observations_duration = (
-            time.perf_counter() - save_observations_start
-        ) * 1000
+        # Log actual observations created as blob metrics
         accumulate_metric(
-            f"deriver_representation_{self.ctx.message_id}_{self.ctx.target_name}",
-            "save_new_observations",
-            save_observations_duration,
-            "ms",
+            f"minimal_deriver_{latest_message.id}_{observed}",
+            "explicit_observations",
+            "\n".join(f"  • {obs}" for obs in observations.explicit),
+            "blob",
         )
 
-        # Only update peer card if we are in Honcho-level representation derivation.
-        if self.ctx.sender_name == self.ctx.target_name:
-            update_peer_card_start = time.perf_counter()
-            # flatten new observations by level into a list
-            new_observations = [
-                extract_observation_content(observation)
-                for level in new_observations_by_level.values()
-                for observation in level
-            ]
-            if new_observations:
-                await self._update_peer_card(speaker_peer_card, new_observations)
-            update_peer_card_duration = (
-                time.perf_counter() - update_peer_card_start
-            ) * 1000
-            accumulate_metric(
-                f"deriver_representation_{self.ctx.message_id}_{self.ctx.target_name}",
-                "update_peer_card",
-                update_peer_card_duration,
-                "ms",
-            )
+    log_performance_metrics("minimal_deriver", f"{latest_message.id}_{observed}")
 
-        return reasoning_response
-
-    @conditional_observe
-    @sentry_sdk.trace
-    async def _save_new_observations(
-        self,
-        original_working_representation: ReasoningResponse,
-        revised_observations: ReasoningResponse,
-    ) -> dict[str, list[str]]:
-        """Save only the observations that are new compared to the original context."""
-        # Use the utility function to find new observations
-        new_observations_by_level: dict[str, list[str]] = find_new_observations(
-            original_working_representation, revised_observations
+    # Emit telemetry event
+    emit(
+        RepresentationCompletedEvent(
+            workspace_name=latest_message.workspace_name,
+            session_name=latest_message.session_name,
+            observed=observed,
+            queue_items_processed=len(queue_item_message_ids),
+            earliest_message_id=earliest_message.public_id,
+            latest_message_id=latest_message.public_id,
+            message_count=len(messages),
+            explicit_conclusion_count=len(observations.explicit),
+            context_preparation_ms=context_prep_duration,
+            llm_call_ms=llm_duration,
+            total_duration_ms=overall_duration,
+            input_tokens=messages_tokens,
+            output_tokens=response.output_tokens,
         )
-
-        all_unified_observations: list[UnifiedObservation] = []
-        total_observations_count: int = 0
-
-        for level, new_observations in new_observations_by_level.items():
-            if not new_observations:
-                logger.debug("No new observations to save for %s level", level)
-                continue
-
-            logger.debug("Found %s new %s observations", len(new_observations), level)
-
-            # Convert each observation to UnifiedObservation with proper premises and level
-            for observation in new_observations:
-                if isinstance(observation, DeductiveObservation):
-                    # Create UnifiedObservation with premises from DeductiveObservation
-                    unified_obs = UnifiedObservation(
-                        conclusion=observation.conclusion,
-                        premises=observation.premises,
-                        level=level,
-                    )
-                    all_unified_observations.append(unified_obs)
-                    logger.debug(
-                        "Added %s observation: %s... with %s premises",
-                        level,
-                        observation.conclusion[:50],
-                        len(observation.premises),
-                    )
-
-                else:
-                    # String observations (explicit) have no premises
-                    unified_obs = UnifiedObservation.from_string(
-                        observation, level=level
-                    )
-                    all_unified_observations.append(unified_obs)
-                    logger.debug("Added %s observation: %s...", level, observation[:50])
-
-                total_observations_count += 1
-
-        if all_unified_observations:
-            await self.embedding_store.save_unified_observations(
-                all_unified_observations,
-                self.ctx.message_id,
-                self.ctx.session_name,
-                self.ctx.created_at,
-            )
-        else:
-            logger.debug("No new observations to save")
-
-        return new_observations_by_level
-
-    @conditional_observe
-    @sentry_sdk.trace
-    async def _update_peer_card(
-        self,
-        old_peer_card: list[str] | None,
-        new_observations: list[str],
-    ) -> None:
-        """
-        Update the peer card by calling LLM with the old peer card and new observations.
-        The new peer card is returned by the LLM and saved to peer internal metadata.
-        """
-        try:
-            response = await peer_card_call(old_peer_card, new_observations)
-            new_peer_card = response.card
-            if new_peer_card is None:
-                logger.info("No changes to peer card")
-                return
-            logger.info("New peer card: %s", new_peer_card)
-            async with tracked_db("deriver.update_peer_card") as db:
-                await crud.set_peer_card(
-                    db, self.ctx.workspace_name, self.ctx.sender_name, new_peer_card
-                )
-        except Exception as e:
-            if settings.SENTRY.ENABLED:
-                sentry_sdk.capture_exception(e)
-            logger.error("Error updating peer card! Skipping... %s", e)
-
-
-def observation_context_to_reasoning_response(
-    context: ObservationContext,
-) -> ReasoningResponseWithThinking:
-    """Convert ObservationContext to ReasoningResponse for compatibility."""
-    thinking = context.thinking
-
-    # Convert explicit observations to new structure
-    explicit: list[str] = []
-    for obs in context.explicit:
-        explicit.append(obs.content)
-
-    # Convert deductive observations
-    deductive: list[DeductiveObservation] = []
-    for obs in context.deductive:
-        deductive_obs = DeductiveObservation(
-            conclusion=obs.content,
-            premises=obs.metadata.premises if obs.metadata else [],
-        )
-        deductive.append(deductive_obs)
-
-    return ReasoningResponseWithThinking(
-        thinking=thinking,
-        explicit=explicit,
-        deductive=deductive,
     )
-
-
-@sentry_sdk.trace
-async def save_working_representation_to_peer(
-    payload: RepresentationPayload,
-    final_observations: ReasoningResponseWithThinking,
-) -> None:
-    """Save working representation to peer internal_metadata for dialectic access."""
-
-    # Convert ReasoningResponse to serializable dict
-    final_obs_dict = {
-        "thinking": final_observations.thinking,
-        "explicit": final_observations.explicit,
-        "deductive": [
-            {
-                "conclusion": obs.conclusion,
-                "premises": obs.premises,
-            }
-            for obs in final_observations.deductive
-        ],
-    }
-
-    working_rep_data = {
-        "final_observations": final_obs_dict,
-        "message_id": payload.message_id,
-        "created_at": utc_now_iso(),
-    }
-
-    async with tracked_db("deriver.save_working_representation") as db:
-        await crud.set_working_representation(
-            db,
-            working_rep_data,
-            payload.workspace_name,
-            payload.target_name,
-            payload.sender_name,
-            payload.session_name,
-        )

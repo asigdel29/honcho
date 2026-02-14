@@ -1,23 +1,107 @@
-# 🫡 Honcho
+<!-- markdownlint-disable MD033 -->
+<div align="center">
+  <a href="https://app.honcho.dev" target="_blank">
+    <img src="assets/honcho.svg" alt="Honcho" width="400">
+  </a>
+</div>
+<!-- markdownlint-enable MD033 -->
 
-![Static Badge](https://img.shields.io/badge/Version-2.3.0-blue)
-[![Discord](https://img.shields.io/discord/1016845111637839922?style=flat&logo=discord&logoColor=23ffffff&label=Plastic%20Labs&labelColor=235865F2)](https://discord.gg/plasticlabs)
-[![arXiv](https://img.shields.io/badge/arXiv-2310.06983-b31b1b.svg)](https://arxiv.org/abs/2310.06983)
-![GitHub License](https://img.shields.io/github/license/plastic-labs/honcho)
-![GitHub Repo stars](https://img.shields.io/github/stars/plastic-labs/honcho)
-[![X (formerly Twitter) URL](https://img.shields.io/twitter/url?url=https%3A%2F%2Ftwitter.com%2Fplastic_labs)](https://twitter.com/plastic_labs)
+---
+
+![Static Badge](https://img.shields.io/badge/Version-3.0.2-blue)
 [![PyPI version](https://img.shields.io/pypi/v/honcho-ai.svg)](https://pypi.org/project/honcho-ai/)
 [![NPM version](https://img.shields.io/npm/v/@honcho-ai/sdk.svg)](https://npmjs.org/package/@honcho-ai/sdk)
+[![Discord](https://img.shields.io/discord/1016845111637839922?style=flat&logo=discord&logoColor=23ffffff&label=Plastic%20Labs&labelColor=235865F2)](https://discord.gg/plasticlabs)
 
-Honcho is an infrastructure layer for building AI agents with social cognition and theory-of-mind capabilities. It enables developers to create AI agents and LLM-powered applications that are personalized to their end users by leveraging the inherent theory-of-mind capabilities of LLMs to build coherent models of user psychology over time.
+Honcho is an open source memory library with a managed service for building stateful
+agents. Use it with any model, framework, or architecture. It enables agents to build
+and maintain state about any entity--users, agents, groups, ideas, and more. And because
+it's a continual learning system, it understands entities that change over time. Using
+Honcho as your memory system will earn your agents higher retention, more trust, and
+help you build data moats to out-compete incumbents.
 
-Read about the project [here](https://blog.plasticlabs.ai/blog/A-Simple-Honcho-Primer).
+> Honcho has defined the Pareto Frontier of Agent Memory. Watch the [video](https://x.com/honchodotdev/status/2002090546521911703?s=20), check out our [evals page](https://evals.honcho.dev/), and read the [blog post](https://blog.plasticlabs.ai/research/Benchmarking-Honcho) for more detail.
 
-Read the user documentation [here](https://docs.honcho.dev)
+## TL;DR - Getting Started
 
-## Table of Contents
+With Honcho you can easily setup your application's workflow, save your
+interaction history, and leverage the reasoning it does to inform the behavior of
+your agents
 
-- [Project Structure](#project-structure)
+> Typescript examples are available in our [docs](https://docs.honcho.dev).
+
+1. Install the SDK
+
+```bash
+# Python
+pip install honcho-ai
+uv add honcho-ai
+poetry add honcho-ai
+```
+
+2. Setup your `Workspace`, `Peers`, `Session`, and send `Messages`
+
+```python
+from honcho import Honcho
+
+# 1. Initialize your Honcho client
+honcho = Honcho(workspace_id="my-app-testing")
+
+# 2. Initialize peers
+alice = honcho.peer("alice")
+tutor = honcho.peer("tutor")
+
+# 3. Create a session and add messages
+
+session = honcho.session("session-1")
+# Adding messages from a peer will automatically add them to the session
+session.add_messages(
+    [
+        alice.message("Hey there — can you help me with my math homework?"),
+        tutor.message("Absolutely. Send me your first problem!"),
+    ]
+)
+```
+
+3. Leverage reasoning from Honcho to inform your agent's behavior
+
+```python
+
+### 1. Use the chat endpoint to ask questions about your users in natural language
+response = alice.chat("What learning styles does the user respond to best?")
+
+### 2. Use session context to continue a conversation with an LLM
+context = session.context(summary=True, tokens=10_000)
+
+# Convert to a format to send to OpenAI and get the next message
+openai_messages = context.to_openai(assistant=tutor)
+
+from openai import OpenAI
+client = OpenAI()
+response = client.chat.completions.create(
+  model="gpt-4",
+  messages=openai_messages
+)
+
+### 3. Search for similar messages
+results = alice.search("Math Homework")
+
+### 4. Get a session-scoped representation of a peer
+alice_representation = session.representation(alice)
+
+```
+
+This is a simple example of how you can use Honcho to build a chatbot and
+leverage insights to personalize the agent's behavior.
+
+Sign up at [app.honcho.dev](https://app.honcho.dev) to get started with a managed version of Honcho.
+
+Learn more ways to use Honcho on our [developer docs](https://docs.honcho.dev).
+
+Read about the design philosophy and history of the project on our [blog](https://blog.plasticlabs.ai/).
+
+## Project Structure
+
 - [Usage](#usage)
 - [Local Development](#local-development)
   - [Prerequisites and Dependencies](#prerequisites-and-dependencies)
@@ -31,32 +115,23 @@ Read the user documentation [here](https://docs.honcho.dev)
   - [Example](#example)
 - [Architecture](#architecture)
   - [Storage](#storage)
-  - [Insights](#insights)
+  - [Reasoning](#reasoning)
+  - [Retrieving Data & Insights](#retrieving-data--insights)
 - [Contributing](#contributing)
 - [License](#license)
-
-## Project Structure
 
 The Honcho project is split between several repositories with this one hosting
 the core service logic. This is implemented as a FastAPI server/API to store
 data about an application's state.
 
-There are also client sdks in implemented in the `sdks/` directory with support
-for Python and TypeScript. These SDKs wrap core SDKs that are generated using
-[Stainless](https://www.stainlessapi.com/).
+There are also client SDKs implemented in the `sdks/` directory with support
+for Python and TypeScript.
 
 - [Python](https://pypi.org/project/honcho-ai/)
 - [TypeScript](https://www.npmjs.com/package/@honcho-ai/sdk)
 
-We recommend using the official client SDKs instead of the core ones for better
-developer experience, however for any custom use cases you can still access the
-core SDKs in their own repos:
-
-- [Honcho Core Python](https://github.com/plastic-labs/honcho-python-core)
-- [Honcho Core TypeScript](https://github.com/plastic-labs/honcho-node-core)
-
 Examples on how to use the SDK are located within each SDK folder and in the
-[SDK Reference](https://docs.honcho.dev/v2/documentation/tutorial/SDK)
+[SDK Reference](https://docs.honcho.dev/v3/documentation/tutorial/SDK)
 
 There are also documented examples of how to use the core SDKs in the
 [API Reference](https://docs.honcho.dev/api-reference/introduction) section of
@@ -64,13 +139,8 @@ the documentation.
 
 ## Usage
 
-When you first install the SDKs they will be ready to go, pointing at
-[https://demo.honcho.dev](https://demo.honcho.dev) which is a demo server of Honcho. This server has no
-authentication, no SLA, and should only be used for testing and getting familiar
-with Honcho.
-
-For a production ready version of Honcho sign up for an account at
-[https://app.honcho.dev](https://app.honcho.dev) and get started. When you sign up you'll be prompted to
+Sign up for an account at
+[https://app.honcho.dev](https://app.honcho.dev) and get started with $100 free credits. When you sign up you'll be prompted to
 join an organization which will have a dedicated instance of Honcho.
 
 Provision API keys and change your base url to point to
@@ -131,7 +201,13 @@ Honcho utilizes [Postgres](https://www.postgresql.org/) for its database with
 pgvector. An easy way to get started with a postgres database is to create a project
 with [Supabase](https://supabase.com/)
 
-A `docker-compose` template is also available with a database configuration.
+Alternatively, a `docker-compose` template is available with a sample database configuration.
+To use Docker:
+
+```bash
+cp docker-compose.yml.example docker-compose.yml
+docker compose up -d database
+```
 
 4. **Edit the environment variables**
 
@@ -178,19 +254,40 @@ the `AUTH_JWT_SECRET` environment variable. This is required for `AUTH_USE_AUTH`
 AUTH_JWT_SECRET=<generated_secret>
 ```
 
-5. **Launch the API**
+5. **Run database migrations**
 
-With the dependencies installed, a database setup and enabled with `pgvector`,
-and the environment variables setup you can now launch a local instance of
-Honcho. The following command will launch the storage API for Honcho:
+With the database set up and environment variables configured, run the migrations
+to create the necessary tables:
 
 ```bash
-fastapi dev src/main.py
+uv run alembic upgrade head
 ```
 
-This is a development server that will reload whenever code is changed. When
-first launching the API with a connection to the database it will provision the
-necessary tables for Honcho to operate.
+This will create all tables for Honcho including workspaces, peers, sessions,
+messages, and the queue system.
+
+6. **Launch Honcho**
+
+With everything set up, you can now launch a local instance of Honcho. In addition to the database, two
+components need to be running:
+
+**Start the API server:**
+
+```bash
+uv run fastapi dev src/main.py
+```
+
+This is a development server that will reload whenever code is changed.
+
+**Start a background worker (deriver):**
+
+In a separate terminal, run:
+
+```bash
+uv run python -m src.deriver
+```
+
+The deriver generates representation, summaries, peer cards, and manages dreaming tasks. You can increase the number of deriver's to improve runtime efficiency.
 
 ### Pre-commit Hooks
 
@@ -303,13 +400,20 @@ cp config.toml.example config.toml
 
 Then modify the values as needed. The TOML file is organized into sections:
 
-- `[app]` - Application-level settings (log level, host, port, embedding settings)
+- `[app]` - Application-level settings (log level, session limits, embedding settings, namespace)
 - `[db]` - Database connection and pool settings
 - `[auth]` - Authentication configuration
+- `[cache]` - Redis cache configuration
 - `[llm]` - LLM provider API keys and general settings
-- `[dialectic]` - Dialectic API configuration (provider, model, search settings)
-- `[deriver]` - Background worker settings and theory of mind configuration
+- `[deriver]` - Background worker settings and representation configuration
+- `[peer_card]` - Peer card generation settings
+- `[dialectic]` - Dialectic API configuration with per-level reasoning settings
 - `[summary]` - Session summarization settings
+- `[dream]` - Dream processing configuration (including specialist models and surprisal settings)
+- `[webhook]` - Webhook configuration
+- `[metrics]` - Prometheus pull-based metrics
+- `[telemetry]` - CloudEvents telemetry for analytics
+- `[vector_store]` - Vector store configuration (pgvector, turbopuffer, or lancedb)
 - `[sentry]` - Error tracking and monitoring settings
 
 ### Using Environment Variables
@@ -323,9 +427,12 @@ Examples:
 
 - `DB_CONNECTION_URI` - Database connection string
 - `AUTH_JWT_SECRET` - JWT secret key
-- `DIALECTIC_MODEL` - Dialectic API model
+- `DIALECTIC_LEVELS__low__MODEL` - Model for low reasoning level
+- `DERIVER_PROVIDER` - Provider for background deriver
 - `SUMMARY_PROVIDER` - Summary generation provider
 - `LOG_LEVEL` - Application log level
+- `METRICS_ENABLED` - Enable Prometheus metrics
+- `TELEMETRY_ENABLED` - Enable CloudEvents telemetry
 
 ### Configuration Priority
 
@@ -367,7 +474,7 @@ and Insights.
 
 ### Peer Paradigm
 
-Honcho uses a peer-based model where both users and agents are represented as "peers". This unified approach enables:
+Honcho uses an entity-centric model where both users and agents are represented as "[peers](https://blog.plasticlabs.ai/blog/Beyond-the-User-Assistant-Paradigm;-Introducing-Peers)". This unified approach enables:
 
 - Multi-participant sessions with mixed human and AI agents
 - Configurable observation settings (which peers observe which others)
@@ -376,8 +483,8 @@ Honcho uses a peer-based model where both users and agents are represented as "p
 
 #### Key Features
 
-- **Theory-of-Mind System**: Multiple implementation methods that extract facts from interactions and build comprehensive models of peer psychology
-- **Dialectic API**: Provides theory-of-mind informed responses that integrate long-term facts with current context
+- **Rich Reasoning System**: Multiple implementation methods that extract conclusions from interactions and build comprehensive representations of peers
+- **Chat API**: Provides reasoning-informed responses that integrate conclusions with current context
 - **Background Processing**: Asynchronous processing pipeline for expensive operations like representation updates and session summarization
 - **Multi-Provider Support**: Configurable LLM providers for different use cases
 
@@ -385,7 +492,7 @@ Honcho uses a peer-based model where both users and agents are represented as "p
 
 Honcho contains several different primitives used for storing application and
 peer data. This data is used for managing conversations, modeling peer
-psychology, building RAG applications, and more.
+identity, building RAG applications, and more.
 
 The philosophy behind Honcho is to provide a platform that is peer-centric and
 easily scalable from a single user to a million.
@@ -396,9 +503,9 @@ Below is a mapping of the different primitives and their relationships.
 Workspaces
 ├── Peers ←──────────────────┐
 │   ├── Sessions             │
-│   ├── Collections          │
-│   │   └── Documents        │
-│   └── Messages (peer-level)│
+│   └── Collections          │
+│       └── Documents        │
+│                            │
 │                            │
 └── Sessions ←───────────────┤ (many-to-many)
     ├── Peers ───────────────┘
@@ -411,7 +518,6 @@ Workspaces
 - **Peers** and **Sessions** have a many-to-many relationship (peers can participate in multiple sessions, sessions can have multiple peers)
 - **Messages** can exist at two levels:
   - **Session-level**: Communication between peers within a session
-  - **Peer-level**: Data ingested by a peer to enhance its global representation
 - **Collections** belong to specific **Peers**
 - **Documents** are stored within **Collections**
 
@@ -420,7 +526,7 @@ much of the mapping here.
 
 #### Workspaces
 
-This is the top level construct of Honcho (formerly called Apps). Developers can register different
+This is the top level construct of Honcho. Developers can register different
 `Workspaces` for different assistants, agents, AI enabled features, etc. It is a way to
 isolate data between use cases and provide multi-tenant capabilities.
 
@@ -441,10 +547,9 @@ Sessions can involve multiple peers with configurable observation settings.
 The `Message` represents an atomic data unit that can exist at two levels:
 
 - **Session-level Messages**: Communication between peers within a session context
-- **Peer-level Messages**: Arbitrary data ingested by a peer to enhance its global representation (independent of any session)
 
 All messages are labeled by their source peer and can be processed
-asynchronously to update theory-of-mind models. This flexible design allows for
+asynchronously to update their representations. This flexible design allows for
 both conversational interactions and broader data ingestion for personality
 modeling.
 
@@ -455,34 +560,54 @@ familiar with RAG based applications will be familiar with these. `Collections`
 store vector embedded data that developers and agents can retrieve against using
 functions like cosine similarity.
 
-Collections are also used internally by Honcho while creating theory-of-mind
-representations of peers.
+Collections are also used internally by Honcho while creating representations of peers.
 
 #### Documents
 
 As stated before a `Document` is vector embedded data stored in a `Collection`.
 
-### Insights
+### Reasoning
 
-The Insight functionality of Honcho is built on top of the Storage service. As
+The reasoning functionality of Honcho is built on top of the Storage service. As
 `Messages` and `Sessions` are created for `Peers`, Honcho will asynchronously
 reason about peer psychology to derive facts about them and store them
 in reserved `Collections`.
 
-The system uses a sophisticated message processing pipeline:
+A high level summary of the pipeline is as follows:
 
-1. Messages are created via API
-2. Enqueued for background processing including:
-   - `representation`: Update peer's theory of mind
-   - `summary`: Create session summaries
+1. Messages are created via the API
+2. Derivation Tasks are enqueued for background processing including:
+   - `representation`: To update representations of `Peers`
+   - `summary`: To create summaries of `Sessions`
 3. Session-based queue processing ensures proper ordering
-4. Results are stored internally in the vector database
+4. Results are stored internally
 
-To read more about how this works read our [Research Paper](https://arxiv.org/abs/2310.06983)
+### Retrieving Data & Insights
 
-Developers can then leverage these insights in their application to better
-serve peer needs. The primary interface for using these insights is through
-the [Dialectic Endpoint](https://blog.plasticlabs.ai/blog/Introducing-Honcho's-Dialectic-API).
+Honcho exposes several different ways to retrieve data from the system to best
+serve the needs of any given application.
+
+#### Get Context
+
+In long-running conversations with an LLM, the context window can fill up
+quickly. To address this, Honcho provides a `context`
+endpoint that returns a combination of messages, conclusions, summaries from a
+session up to a provided token limit.
+
+Use this to keep sessions going indefinitely. If you'd like to see this in action, try out [Honcho Chat](https://honcho.chat).
+
+#### Search
+
+There are several search endpoints that let developers query messages at the
+`Workspace`, `Session`, or `Peer` level using a hybrid search strategy.
+
+Requests can include advanced filters to further refine
+the results.
+
+#### Chat API
+
+The flagship interface for using these insights is through
+the [`Chat` Endpoint](https://blog.plasticlabs.ai/archive/ARCHIVED;-Introducing-Honcho's-Dialectic-API).
 
 This is a regular API endpoint (`/peers/{peer_id}/chat`) that takes natural language requests to get data
 about the `Peer`. This robust design lets us use this single endpoint for all
@@ -492,10 +617,20 @@ A developer's application can treat Honcho as an oracle to the `Peer` and
 consult it when necessary. Some examples of how to leverage the Dialectic
 API include:
 
-- Asking Honcho for a theory-of-mind insight about the `Peer`
+- Asking Honcho for a generic or specific insight about the `Peer`
 - Asking Honcho to hydrate a prompt with data about the `Peer`s behavior
 - Asking Honcho for a 2nd opinion or approach about how to respond to the Peer
 - Getting personalized responses that incorporate long-term facts and context
+
+#### Representations
+
+For low-latency use cases,
+Honcho provides access to a `representation` endpoint that
+returns a static document with insights about a `Peer` in the context of a
+particular session.
+
+Use this to quickly add context to a prompt without having to wait for an LLM
+response.
 
 ## Contributing
 

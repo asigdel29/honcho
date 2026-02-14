@@ -4,8 +4,10 @@ api/docker-compose.yml
 
 *.db
 data
+redis-data
 docker-compose.yml
 compose.yml
+
 
 
 # Byte-compiled / optimized / DLL files
@@ -184,3 +186,8 @@ config.toml
 
 CRUSH.md
 .crush/
+
+metrics.jsonl
+AGENTS.md
+lancedb_data/
+grafana-data/

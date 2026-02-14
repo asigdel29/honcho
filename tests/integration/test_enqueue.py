@@ -4,11 +4,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from nanoid import generate as generate_nanoid
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, models, schemas
 from src.deriver import enqueue
+from src.deriver.enqueue import generate_queue_records
 from src.models import Peer, QueueItem, Workspace
 
 
@@ -26,6 +27,15 @@ class TestEnqueueFunction:
         count: int = 1,
     ) -> list[dict[str, Any]]:
         """Create real messages in database and return payload with actual IDs"""
+        # Get the current max sequence number for this session
+        result = await db_session.execute(
+            select(func.max(models.Message.seq_in_session)).where(
+                models.Message.workspace_name == workspace_name,
+                models.Message.session_name == session_name,
+            )
+        )
+        current_max_seq = result.scalar() or 0
+
         messages: list[models.Message] = []
         for i in range(count):
             message = models.Message(
@@ -34,6 +44,7 @@ class TestEnqueueFunction:
                 peer_name=peer_name,
                 content=f"Test message {i}",
                 public_id=generate_nanoid(),
+                seq_in_session=current_max_seq + i + 1,
                 token_count=10,
                 h_metadata={"test": f"value_{i}"},
             )
@@ -78,23 +89,19 @@ class TestEnqueueFunction:
 
     # SESSION MESSAGES
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_session_with_deriver_disabled(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test that deriver disabled sessions skip representation but allows summary"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer = sample_data
 
         # Create session with deriver disabled
         test_session = models.Session(
             workspace_name=test_workspace.name,
             name=str(generate_nanoid()),
-            configuration={"deriver_disabled": True},
+            configuration={"deriver": {"enabled": False}},
         )
         db_session.add(test_session)
         await db_session.commit()
@@ -118,25 +125,23 @@ class TestEnqueueFunction:
         ), f"Expected no queue items, but got {final_count - initial_count}"
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_session_normal_processing_single_peer(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer = sample_data
 
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={test_peer.name: schemas.SessionPeerConfig(observe_me=True)},
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={test_peer.name: schemas.SessionPeerConfig(observe_me=True)},
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         payload = await self.create_sample_payload(
@@ -163,16 +168,12 @@ class TestEnqueueFunction:
         assert "representation" in task_types
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_session_with_multiple_peers_none_observe_others(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test session processing with multiple peers where some observe others"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer1 = sample_data
 
         # Create second peer
@@ -181,17 +182,19 @@ class TestEnqueueFunction:
         )
         db_session.add(test_peer2)
 
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    test_peer1.name: schemas.SessionPeerConfig(),
-                    test_peer2.name: schemas.SessionPeerConfig(),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        test_peer1.name: schemas.SessionPeerConfig(),
+                        test_peer2.name: schemas.SessionPeerConfig(),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
 
         await db_session.commit()
 
@@ -217,42 +220,20 @@ class TestEnqueueFunction:
         )
         queue_items = result.scalars().all()
 
-        # Explicitly match up payloads by sender/target/task_type
-        # For each message, we expect a representation
-        expected_payloads: list[dict[str, Any]] = []
-        for _ in range(NUM_MESSAGES):
-            expected_payloads.append(
-                {
-                    "sender_name": test_peer1.name,
-                    "target_name": test_peer1.name,
-                    "task_type": "representation",
-                }
-            )
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
-        assert len(actual_payloads) == len(expected_payloads)
-
-        # Assert that all expected payloads are present in actual_payloads
-        for expected in expected_payloads:
-            assert expected in actual_payloads
+        # With deduplication, each message creates 1 queue item with observers list
+        # For each message, we expect a representation with observers=[sender]
+        for item in queue_items:
+            assert item.payload.get("task_type") == "representation"
+            assert item.payload.get("observed") == test_peer1.name
+            assert item.payload.get("observers") == [test_peer1.name]
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_session_with_multiple_peers_all_observe_others(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test session processing with multiple peers where some observe others"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer1 = sample_data
 
         # Create second peer
@@ -261,17 +242,19 @@ class TestEnqueueFunction:
         )
         db_session.add(test_peer2)
 
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    test_peer1.name: schemas.SessionPeerConfig(),
-                    test_peer2.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        test_peer1.name: schemas.SessionPeerConfig(),
+                        test_peer2.name: schemas.SessionPeerConfig(observe_others=True),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         NUM_MESSAGES = 3
@@ -287,58 +270,30 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create NUM_MESSAGES * 2 queue items:
-        # 1 representation for sender, 1 local representation for observer
-        assert final_count - initial_count == NUM_MESSAGES * 2
+        # With deduplication: 1 queue item per message (with all observers in a list)
+        assert final_count - initial_count == NUM_MESSAGES
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        # Explicitly match up payloads by sender/target/task_type
-        # For each message, we expect a representation and a local representation for observer
-        expected_payloads: list[dict[str, Any]] = []
-        for _ in range(NUM_MESSAGES):
-            expected_payloads.append(
-                {
-                    "sender_name": test_peer1.name,
-                    "target_name": test_peer1.name,
-                    "task_type": "representation",
-                }
-            )
-            expected_payloads.append(
-                {
-                    "sender_name": test_peer1.name,
-                    "target_name": test_peer2.name,
-                    "task_type": "representation",
-                }
-            )
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
-        assert len(actual_payloads) == len(expected_payloads)
-
-        # Assert that all expected payloads are present in actual_payloads
-        for expected in expected_payloads:
-            assert expected in actual_payloads
+        # Each queue item should have both observers in the list
+        for item in queue_items:
+            assert item.payload.get("task_type") == "representation"
+            assert item.payload.get("observed") == test_peer1.name
+            observers = item.payload.get("observers")
+            assert observers is not None
+            assert test_peer1.name in observers  # self-observation
+            assert test_peer2.name in observers  # peer2 observes others
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_session_with_multiple_peers_some_observe_others(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test session processing with multiple peers where some observe others"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer1 = sample_data
 
         # Create second peer
@@ -354,18 +309,22 @@ class TestEnqueueFunction:
         db_session.add(unobserving_peer)
 
         # Create session
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    test_peer1.name: schemas.SessionPeerConfig(observe_me=True),
-                    observing_peer.name: schemas.SessionPeerConfig(observe_others=True),
-                    unobserving_peer.name: schemas.SessionPeerConfig(),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        test_peer1.name: schemas.SessionPeerConfig(observe_me=True),
+                        observing_peer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                        unobserving_peer.name: schemas.SessionPeerConfig(),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         NUM_MESSAGES = 3
@@ -381,76 +340,49 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create NUM_MESSAGES * 2 queue items:
-        # 1 representation for sender, 1 local representation for 1 peer observer
-        assert final_count - initial_count == NUM_MESSAGES * 2
+        # With deduplication: 1 queue item per message (with all observers in a list)
+        assert final_count - initial_count == NUM_MESSAGES
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        # Explicitly match up payloads by sender/target/task_type
-        # For each message, we expect a representation and a local representation for observer
-        expected_payloads: list[dict[str, Any]] = []
-        for _ in range(NUM_MESSAGES):
-            expected_payloads.append(
-                {
-                    "sender_name": test_peer1.name,
-                    "target_name": test_peer1.name,
-                    "task_type": "representation",
-                }
-            )
-            expected_payloads.append(
-                {
-                    "sender_name": test_peer1.name,
-                    "target_name": observing_peer.name,
-                    "task_type": "representation",
-                }
-            )
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
-        assert len(actual_payloads) == len(expected_payloads)
-
-        # Assert that all expected payloads are present in actual_payloads
-        for expected in expected_payloads:
-            assert expected in actual_payloads
-
-        assert unobserving_peer.name not in [
-            item.payload.get("target_name") for item in queue_items
-        ]
+        # Each queue item should have sender and observing_peer as observers
+        for item in queue_items:
+            assert item.payload.get("task_type") == "representation"
+            assert item.payload.get("observed") == test_peer1.name
+            observers = item.payload.get("observers")
+            assert observers is not None
+            assert test_peer1.name in observers  # self-observation
+            assert observing_peer.name in observers  # observing_peer observes others
+            assert (
+                unobserving_peer.name not in observers
+            )  # unobserving_peer does not observe
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_session_peer_config_overrides_peer_config(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test that session peer config overrides peer config"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer = sample_data
 
         # Set peer configuration to observe_me=True
         test_peer.configuration = {"observe_me": True}
 
         # Create session
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={test_peer.name: schemas.SessionPeerConfig(observe_me=False)},
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={test_peer.name: schemas.SessionPeerConfig(observe_me=False)},
+                ),
+                test_workspace.name,
+            )
+        ).resource
 
         await db_session.commit()
 
@@ -469,16 +401,12 @@ class TestEnqueueFunction:
         assert final_count - initial_count == 0
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_multi_sender_scenario(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test complex scenario with multiple peers and mixed configurations"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, test_peer1 = sample_data
 
         # Create additional peers
@@ -492,18 +420,22 @@ class TestEnqueueFunction:
 
         db_session.add_all([additional_sender_peer, observer_peer])
 
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    test_peer1.name: schemas.SessionPeerConfig(),
-                    additional_sender_peer.name: schemas.SessionPeerConfig(),
-                    observer_peer.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        test_peer1.name: schemas.SessionPeerConfig(),
+                        additional_sender_peer.name: schemas.SessionPeerConfig(),
+                        observer_peer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         payload1 = await self.create_sample_payload(
@@ -526,66 +458,40 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create 4 queue items:
-        # 1 representation for test_peer1 (sender) and observer_peer (target)
-        # 1 representation for additional_sender_peer (sender) and observer_peer (target)
-        assert final_count - initial_count == 4
+        # With deduplication: 1 queue item per message (2 messages total)
+        assert final_count - initial_count == 2
 
         # Verify the correct representations were created
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
-        queue_items = result.all()
+        queue_items = result.scalars().all()
 
-        # Build expected payloads for this scenario
-        expected_payloads: list[dict[str, Any]] = []
-        # 2 messages: one from test_peer1, one from additional_sender_peer
-        for sender in [test_peer1.name, additional_sender_peer.name]:
-            # representation for sender (self)
-            expected_payloads.append(
-                {
-                    "task_type": "representation",
-                    "sender_name": sender,
-                    "target_name": sender,
-                }
-            )
-            # representation for observer_peer (observe_others=True)
-            expected_payloads.append(
-                {
-                    "task_type": "representation",
-                    "sender_name": sender,
-                    "target_name": observer_peer.name,
-                }
-            )
+        # Each message should have a queue item with observers list containing
+        # the sender and observer_peer
+        senders_found: set[str] = set()
+        for item in queue_items:
+            assert item.payload.get("task_type") == "representation"
+            observed = item.payload.get("observed")
+            observers = item.payload.get("observers")
+            assert observed is not None
+            assert observers is not None
+            senders_found.add(observed)
+            assert observed in observers  # self-observation
+            assert observer_peer.name in observers  # observer_peer observes others
 
-        # Extract actual payloads (task_type, sender_name, target_name) from queue_items
-        actual_payloads = [
-            {
-                "task_type": item[0].payload.get("task_type"),
-                "sender_name": item[0].payload.get("sender_name"),
-                "target_name": item[0].payload.get("target_name"),
-            }
-            for item in queue_items
-        ]
-
-        assert len(actual_payloads) == len(expected_payloads)
-
-        # For each expected payload, assert it is present in actual_payloads
-        for expected in expected_payloads:
-            assert expected in actual_payloads
+        # Both senders should have queue items
+        assert test_peer1.name in senders_found
+        assert additional_sender_peer.name in senders_found
 
     # RACE CONDITION TESTS - Testing the new logic for peers that have left
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_sender_left_session_after_message_sent(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test that messages from senders who left the session still get processed with default config"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, sender_peer = sample_data
 
         # Create an observer peer
@@ -595,17 +501,21 @@ class TestEnqueueFunction:
         db_session.add(observer_peer)
 
         # Create session with both peers
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
-                    observer_peer.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
+                        observer_peer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Simulate sender leaving the session by setting left_at
@@ -633,52 +543,30 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create 2 queue items:
-        # 1 representation for sender (using default config since they left)
-        # 1 representation for observer (still in session and observing others)
-        assert final_count - initial_count == 2
+        # With deduplication: 1 queue item per message with all observers
+        assert final_count - initial_count == 1
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        expected_payloads = [
-            {
-                "sender_name": sender_peer.name,
-                "target_name": sender_peer.name,
-                "task_type": "representation",
-            },
-            {
-                "sender_name": sender_peer.name,
-                "target_name": observer_peer.name,
-                "task_type": "representation",
-            },
-        ]
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
-
-        assert len(actual_payloads) == len(expected_payloads)
-        for expected in expected_payloads:
-            assert expected in actual_payloads
+        assert len(queue_items) == 1
+        item = queue_items[0]
+        assert item.payload.get("task_type") == "representation"
+        assert item.payload.get("observed") == sender_peer.name
+        observers = item.payload.get("observers")
+        assert observers is not None
+        assert sender_peer.name in observers  # self-observation (default config)
+        assert observer_peer.name in observers  # observer still in session
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_observer_left_session_no_queue_items_generated(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test that peers who left the session don't get representation tasks enqueued"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, sender_peer = sample_data
 
         # Create observer peers - one will leave, one will stay
@@ -691,22 +579,24 @@ class TestEnqueueFunction:
         db_session.add_all([observer_who_left, observer_who_stayed])
 
         # Create session with all peers
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
-                    observer_who_left.name: schemas.SessionPeerConfig(
-                        observe_others=True
-                    ),
-                    observer_who_stayed.name: schemas.SessionPeerConfig(
-                        observe_others=True
-                    ),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
+                        observer_who_left.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                        observer_who_stayed.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Simulate one observer leaving the session
@@ -734,33 +624,30 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create 2 queue items:
-        # 1 representation for sender
-        # 1 representation for observer_who_stayed (observer_who_left should be skipped)
-        assert final_count - initial_count == 2
+        # With deduplication: 1 queue item per message with all observers
+        assert final_count - initial_count == 1
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        # Verify observer_who_left is NOT in the target names
-        target_names = [item.payload.get("target_name") for item in queue_items]
-        assert observer_who_left.name not in target_names
-        assert observer_who_stayed.name in target_names
-        assert sender_peer.name in target_names
+        assert len(queue_items) == 1
+        item = queue_items[0]
+        observers = item.payload.get("observers")
+        assert observers is not None
+        # Verify observer_who_left is NOT in the observers list
+        assert observer_who_left.name not in observers
+        assert observer_who_stayed.name in observers
+        assert sender_peer.name in observers
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_sender_not_in_peer_configuration_uses_defaults(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test get_effective_observe_me handles missing sender configuration gracefully"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, existing_peer = sample_data
 
         # Create observer peer
@@ -770,16 +657,20 @@ class TestEnqueueFunction:
         db_session.add(observer_peer)
 
         # Create session with only observer (sender not in peers_with_configuration)
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    observer_peer.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        observer_peer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Create message from peer NOT in the session configuration
@@ -795,52 +686,30 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create 2 queue items:
-        # 1 representation for unknown sender (using default observe_me=True)
-        # 1 representation for observer (observing others)
-        assert final_count - initial_count == 2
+        # With deduplication: 1 queue item per message with all observers
+        assert final_count - initial_count == 1
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        expected_payloads = [
-            {
-                "sender_name": existing_peer.name,
-                "target_name": existing_peer.name,
-                "task_type": "representation",
-            },
-            {
-                "sender_name": existing_peer.name,
-                "target_name": observer_peer.name,
-                "task_type": "representation",
-            },
-        ]
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
-
-        assert len(actual_payloads) == len(expected_payloads)
-        for expected in expected_payloads:
-            assert expected in actual_payloads
+        assert len(queue_items) == 1
+        item = queue_items[0]
+        assert item.payload.get("task_type") == "representation"
+        assert item.payload.get("observed") == existing_peer.name
+        observers = item.payload.get("observers")
+        assert observers is not None
+        assert existing_peer.name in observers  # self-observation (default)
+        assert observer_peer.name in observers  # observer (observing others)
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_mixed_active_inactive_peers_complex_scenario(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test complex scenario with mix of active/inactive peers and different configurations"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, sender_peer = sample_data
 
         # Create multiple peers with different roles
@@ -867,28 +736,30 @@ class TestEnqueueFunction:
         )
 
         # Create session with all peers having different configurations
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
-                    active_observer.name: schemas.SessionPeerConfig(
-                        observe_others=True
-                    ),
-                    inactive_observer.name: schemas.SessionPeerConfig(
-                        observe_others=True
-                    ),
-                    active_non_observer.name: schemas.SessionPeerConfig(
-                        observe_others=False
-                    ),
-                    inactive_non_observer.name: schemas.SessionPeerConfig(
-                        observe_others=False
-                    ),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
+                        active_observer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                        inactive_observer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                        active_non_observer.name: schemas.SessionPeerConfig(
+                            observe_others=False
+                        ),
+                        inactive_non_observer.name: schemas.SessionPeerConfig(
+                            observe_others=False
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Mark some peers as having left the session
@@ -917,49 +788,27 @@ class TestEnqueueFunction:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create 2 queue items:
-        # 1 representation for sender (observe_me=True)
-        # 1 representation for active_observer (observe_others=True and still active)
-        # inactive_observer should be skipped (left session)
-        # active_non_observer should be skipped (observe_others=False)
-        # inactive_non_observer should be skipped (left session)
-        assert final_count - initial_count == 2
+        # With deduplication: 1 queue item per message with all observers
+        assert final_count - initial_count == 1
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        expected_payloads = [
-            {
-                "sender_name": sender_peer.name,
-                "target_name": sender_peer.name,
-                "task_type": "representation",
-            },
-            {
-                "sender_name": sender_peer.name,
-                "target_name": active_observer.name,
-                "task_type": "representation",
-            },
-        ]
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
+        assert len(queue_items) == 1
+        item = queue_items[0]
+        assert item.payload.get("task_type") == "representation"
+        assert item.payload.get("observed") == sender_peer.name
+        observers = item.payload.get("observers")
+        assert observers is not None
+        assert sender_peer.name in observers  # self-observation
+        assert active_observer.name in observers  # active and observing
 
-        assert len(actual_payloads) == len(expected_payloads)
-        for expected in expected_payloads:
-            assert expected in actual_payloads
-
-        # Verify inactive peers are not in target names
-        target_names = [item.payload.get("target_name") for item in queue_items]
-        assert inactive_observer.name not in target_names
-        assert inactive_non_observer.name not in target_names
-        assert active_non_observer.name not in target_names
+        # Verify inactive and non-observing peers are not in observers list
+        assert inactive_observer.name not in observers
+        assert inactive_non_observer.name not in observers
+        assert active_non_observer.name not in observers
 
 
 class TestGetEffectiveObserveMeFunction:
@@ -1058,14 +907,14 @@ class TestGetEffectiveObserveMeFunction:
             if peer_config is None:
                 # Test missing sender
                 peers_with_configuration = {}
-                sender_name = "missing_sender"
+                observed = "missing_sender"
             else:
                 peers_with_configuration = {
                     f"sender_{i}": [peer_config or {}, session_config or {}]
                 }
-                sender_name = f"sender_{i}"
+                observed = f"sender_{i}"
 
-            result = get_effective_observe_me(sender_name, peers_with_configuration)
+            result = get_effective_observe_me(observed, peers_with_configuration)
             assert (
                 result == expected
             ), f"Test case {i} failed: peer_config={peer_config}, session_config={session_config}, expected={expected}, got={result}"
@@ -1085,6 +934,15 @@ class TestAdvancedEnqueueEdgeCases:
         count: int = 1,
     ) -> list[dict[str, Any]]:
         """Create real messages in database and return payload with actual IDs"""
+        # Get the current max sequence number for this session
+        result = await db_session.execute(
+            select(func.max(models.Message.seq_in_session)).where(
+                models.Message.workspace_name == workspace_name,
+                models.Message.session_name == session_name,
+            )
+        )
+        current_max_seq = result.scalar() or 0
+
         messages: list[models.Message] = []
         for i in range(count):
             message = models.Message(
@@ -1093,6 +951,7 @@ class TestAdvancedEnqueueEdgeCases:
                 peer_name=peer_name,
                 content=f"Test message {i}",
                 public_id=generate_nanoid(),
+                seq_in_session=current_max_seq + i + 1,
                 token_count=10,
                 h_metadata={"test": f"value_{i}"},
             )
@@ -1121,16 +980,12 @@ class TestAdvancedEnqueueEdgeCases:
         return len(result.scalars().all())
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_edge_case_all_peers_left_except_sender(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test edge case where all observer peers have left the session"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, sender_peer = sample_data
 
         # Create multiple observer peers
@@ -1143,18 +998,20 @@ class TestAdvancedEnqueueEdgeCases:
         db_session.add_all([observer1, observer2])
 
         # Create session with all peers
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
-                    observer1.name: schemas.SessionPeerConfig(observe_others=True),
-                    observer2.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
+                        observer1.name: schemas.SessionPeerConfig(observe_others=True),
+                        observer2.name: schemas.SessionPeerConfig(observe_others=True),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Mark all observers as having left
@@ -1192,21 +1049,17 @@ class TestAdvancedEnqueueEdgeCases:
         queue_items = result.scalars().all()
 
         assert len(queue_items) == 1
-        assert queue_items[0].payload["sender_name"] == sender_peer.name
-        assert queue_items[0].payload["target_name"] == sender_peer.name
+        assert queue_items[0].payload["observed"] == sender_peer.name
+        assert queue_items[0].payload["observers"] == [sender_peer.name]
         assert queue_items[0].payload["task_type"] == "representation"
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_edge_case_sender_and_observer_both_left_different_times(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test race condition where both sender and observer left at different times"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, sender_peer = sample_data
 
         observer_peer = models.Peer(
@@ -1215,17 +1068,21 @@ class TestAdvancedEnqueueEdgeCases:
         db_session.add(observer_peer)
 
         # Create session
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
-                    observer_peer.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        sender_peer.name: schemas.SessionPeerConfig(observe_me=True),
+                        observer_peer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Mark both as having left (observer left first, then sender)
@@ -1278,21 +1135,17 @@ class TestAdvancedEnqueueEdgeCases:
         queue_items = result.scalars().all()
 
         assert len(queue_items) == 1
-        assert queue_items[0].payload["sender_name"] == sender_peer.name
-        assert queue_items[0].payload["target_name"] == sender_peer.name
+        assert queue_items[0].payload["observed"] == sender_peer.name
+        assert queue_items[0].payload["observers"] == [sender_peer.name]
         assert queue_items[0].payload["task_type"] == "representation"
 
     @pytest.mark.asyncio
-    @patch("src.deriver.enqueue.tracked_db")
     async def test_edge_case_message_from_never_joined_peer(
         self,
-        mock_tracked_db: AsyncMock,
         db_session: AsyncSession,
         sample_data: tuple[Workspace, Peer],
     ):
         """Test handling message from peer who was never in the session"""
-        mock_tracked_db.return_value.__aenter__.return_value = db_session
-
         test_workspace, existing_peer = sample_data
 
         observer_peer = models.Peer(
@@ -1301,16 +1154,20 @@ class TestAdvancedEnqueueEdgeCases:
         db_session.add(observer_peer)
 
         # Create session with only observer peer
-        test_session = await crud.get_or_create_session(
-            db_session,
-            schemas.SessionCreate(
-                name=str(generate_nanoid()),
-                peers={
-                    observer_peer.name: schemas.SessionPeerConfig(observe_others=True),
-                },
-            ),
-            test_workspace.name,
-        )
+        test_session = (
+            await crud.get_or_create_session(
+                db_session,
+                schemas.SessionCreate(
+                    name=str(generate_nanoid()),
+                    peers={
+                        observer_peer.name: schemas.SessionPeerConfig(
+                            observe_others=True
+                        ),
+                    },
+                ),
+                test_workspace.name,
+            )
+        ).resource
         await db_session.commit()
 
         # Create message from peer who was NEVER in the session
@@ -1325,37 +1182,182 @@ class TestAdvancedEnqueueEdgeCases:
         await enqueue(payload)
         final_count = await self.count_queue_items(db_session)
 
-        # Should create 2 queue items:
-        # 1 for never_joined_peer (using default config)
-        # 1 for observer (observe_others=True)
-        assert final_count - initial_count == 2
+        # With deduplication: 1 queue item per message with all observers
+        assert final_count - initial_count == 1
 
         result = await db_session.execute(
             select(QueueItem).where(QueueItem.session_id == test_session.id)
         )
         queue_items = result.scalars().all()
 
-        expected_payloads = [
-            {
-                "sender_name": existing_peer.name,
-                "target_name": existing_peer.name,
-                "task_type": "representation",
-            },
-            {
-                "sender_name": existing_peer.name,
-                "target_name": observer_peer.name,
-                "task_type": "representation",
-            },
-        ]
-        actual_payloads = [
-            {
-                "sender_name": item.payload.get("sender_name"),
-                "target_name": item.payload.get("target_name"),
-                "task_type": item.payload.get("task_type"),
-            }
-            for item in queue_items
-        ]
+        assert len(queue_items) == 1
+        item = queue_items[0]
+        assert item.payload.get("task_type") == "representation"
+        assert item.payload.get("observed") == existing_peer.name
+        observers = item.payload.get("observers")
+        assert observers is not None
+        assert existing_peer.name in observers  # self-observation (default)
+        assert observer_peer.name in observers  # observer (observing others)
 
-        assert len(actual_payloads) == len(expected_payloads)
-        for expected in expected_payloads:
-            assert expected in actual_payloads
+
+@pytest.mark.asyncio
+class TestGenerateQueueRecordsSeqInSession:
+    """Unit tests for generate_queue_records function focusing on seq_in_session handling"""
+
+    async def test_generate_queue_records_uses_seq_from_payload_not_crud(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+    ):
+        """
+        Test that generate_queue_records uses seq_in_session from payload
+        instead of making a CRUD call to get_message_seq_in_session.
+        """
+
+        test_workspace, test_peer = sample_data
+
+        # Create a test session
+        test_session = models.Session(
+            workspace_name=test_workspace.name, name=str(generate_nanoid())
+        )
+        db_session.add(test_session)
+        await db_session.commit()
+
+        # Create a message payload with seq_in_session included
+        message_payload = {
+            "message_id": 12345,
+            "peer_name": test_peer.name,
+            "workspace_name": test_workspace.name,
+            "session_name": test_session.name,
+            "content": "Test message",
+            "seq_in_session": 20,  # Multiple of MESSAGES_PER_SHORT_SUMMARY to trigger summary creation
+            "created_at": datetime.now(timezone.utc),  # Required by create_payload
+        }
+
+        # Mock the CRUD function to track if it's called
+        # Also enable summary generation in settings
+        with (
+            patch("src.deriver.enqueue.crud.get_message_seq_in_session") as mock_crud,
+            patch("src.deriver.enqueue.settings.SUMMARY.ENABLED", new=True),
+        ):
+            mock_crud.return_value = 200
+            mock_db_session = AsyncMock()
+
+            peers_config: dict[str, list[Any]] = {
+                test_peer.name: [
+                    {"observe_me": True},
+                    {"observe_others": True},
+                ]
+            }
+            resolved_configuration = schemas.ResolvedConfiguration(
+                reasoning=schemas.ResolvedReasoningConfiguration(enabled=True),
+                summary=schemas.ResolvedSummaryConfiguration(
+                    enabled=True,
+                    messages_per_short_summary=20,
+                    messages_per_long_summary=60,
+                ),
+                peer_card=schemas.ResolvedPeerCardConfiguration(use=True, create=True),
+                dream=schemas.ResolvedDreamConfiguration(enabled=True),
+            )
+            records = await generate_queue_records(
+                db_session=mock_db_session,
+                message=message_payload,
+                peers_with_configuration=peers_config,
+                session_id=test_session.id,
+                conf=resolved_configuration,
+            )
+
+            mock_crud.assert_not_called()
+
+            assert len(records) > 0
+
+            summary_records = [r for r in records if r["task_type"] == "summary"]
+            assert len(summary_records) > 0, "Expected summary records to be created"
+            for record in summary_records:
+                assert (
+                    record["payload"]["message_seq_in_session"]
+                    != mock_crud.return_value
+                )
+                assert record["payload"]["message_seq_in_session"] == 20
+
+    async def test_generate_queue_records_falls_back_to_crud_when_seq_missing(
+        self,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+    ):
+        """
+        Test that generate_queue_records falls back to CRUD call
+        when seq_in_session is missing from payload.
+
+        This is the fallback behavior for backward compatibility.
+        """
+
+        test_workspace, test_peer = sample_data
+
+        # Create a test session
+        test_session = models.Session(
+            workspace_name=test_workspace.name, name=str(generate_nanoid())
+        )
+        db_session.add(test_session)
+        await db_session.commit()
+
+        # Create a message payload WITHOUT seq_in_session
+        message_payload = {
+            "message_id": 12345,
+            "peer_name": test_peer.name,
+            "workspace_name": test_workspace.name,
+            "session_name": test_session.name,
+            "content": "Test message",
+            "created_at": datetime.now(timezone.utc),
+            # seq_in_session is MISSING
+        }
+
+        # Mock the CRUD function and enable summary generation in settings
+        with (
+            patch("src.deriver.enqueue.crud.get_message_seq_in_session") as mock_crud,
+            patch("src.deriver.enqueue.settings.SUMMARY.ENABLED", True),
+        ):
+            mock_crud.return_value = (
+                60  # Multiple of MESSAGES_PER_LONG_SUMMARY to trigger summary creation
+            )
+
+            mock_db_session = AsyncMock()
+
+            peers_config: dict[str, list[Any]] = {
+                test_peer.name: [
+                    {"observe_me": True},
+                    {"observe_others": True},
+                ]
+            }
+            resolved_configuration = schemas.ResolvedConfiguration(
+                reasoning=schemas.ResolvedReasoningConfiguration(enabled=True),
+                summary=schemas.ResolvedSummaryConfiguration(
+                    enabled=True,
+                    messages_per_short_summary=20,
+                    messages_per_long_summary=60,
+                ),
+                peer_card=schemas.ResolvedPeerCardConfiguration(use=True, create=True),
+                dream=schemas.ResolvedDreamConfiguration(enabled=True),
+            )
+            records = await generate_queue_records(
+                db_session=mock_db_session,
+                message=message_payload,
+                peers_with_configuration=peers_config,
+                session_id=test_session.id,
+                conf=resolved_configuration,
+            )
+
+            # The CRUD function SHOULD have been called as fallback
+            mock_crud.assert_called_once_with(
+                mock_db_session,
+                workspace_name=test_workspace.name,
+                session_name=test_session.name,
+                message_id=12345,
+            )
+
+            # Verify that records were created with the fallback value
+            summary_records = [r for r in records if r["task_type"] == "summary"]
+            assert len(summary_records) > 0, "Expected summary records to be created"
+            for record in summary_records:
+                # Should use the value from CRUD fallback (60)
+                assert record["payload"]["message_seq_in_session"] == 60

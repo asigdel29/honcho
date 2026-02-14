@@ -22,6 +22,7 @@ from src.dependencies import db
 from src.deriver import enqueue
 from src.exceptions import FileTooLargeError, ResourceNotFoundException
 from src.security import require_auth
+from src.telemetry import prometheus_metrics
 from src.utils.files import process_file_uploads_for_messages
 
 logger = logging.getLogger(__name__)
@@ -35,12 +36,54 @@ router = APIRouter(
 )
 
 
-async def parse_upload_form(peer_id: str = Form(...)) -> schemas.MessageUploadCreate:
+async def parse_upload_form(
+    peer_id: str = Form(...),
+    metadata: str | None = Form(None),
+    configuration: str | None = Form(None),
+    created_at: str | None = Form(None),
+) -> schemas.MessageUploadCreate:
     """Parse form data for file upload requests"""
-    return schemas.MessageUploadCreate(peer_id=peer_id)
+    import json
+    from datetime import datetime
+
+    parsed_metadata = None
+    if metadata:
+        try:
+            parsed_metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse metadata JSON: {metadata}")
+            parsed_metadata = None
+
+    parsed_configuration = None
+    if configuration:
+        try:
+            parsed_configuration = json.loads(configuration)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse configuration JSON: {configuration}")
+            parsed_configuration = None
+
+    parsed_created_at = None
+    if created_at:
+        try:
+            parsed_created_at = datetime.fromisoformat(
+                created_at.replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError):
+            logger.warning(f"Failed to parse created_at: {created_at}")
+            parsed_created_at = None
+
+    return schemas.MessageUploadCreate(
+        peer_id=peer_id,
+        metadata=parsed_metadata,
+        configuration=parsed_configuration,
+        created_at=parsed_created_at,
+    )
 
 
-@router.post("/", response_model=list[schemas.Message])
+@router.post("", response_model=list[schemas.Message], status_code=201)
+@router.post(
+    "/", response_model=list[schemas.Message], status_code=201, include_in_schema=False
+)  # backwards compatibility with pre-2.6.0 faulty route endpoint
 async def create_messages_for_session(
     background_tasks: BackgroundTasks,
     messages: schemas.MessageBatchCreate,
@@ -48,7 +91,7 @@ async def create_messages_for_session(
     session_id: str = Path(...),
     db: AsyncSession = db,
 ):
-    """Create messages for a session with JSON data (original functionality)."""
+    """Add new message(s) to a session."""
     try:
         created_messages = await crud.create_messages(
             db,
@@ -56,6 +99,13 @@ async def create_messages_for_session(
             workspace_name=workspace_id,
             session_name=session_id,
         )
+
+        # Prometheus metrics
+        if settings.METRICS.ENABLED:
+            prometheus_metrics.record_messages_created(
+                count=len(created_messages),
+                workspace_name=workspace_id,
+            )
 
         # Enqueue for processing (existing logic)
         payloads = [
@@ -66,19 +116,25 @@ async def create_messages_for_session(
                 "content": message.content,
                 "peer_name": message.peer_name,
                 "created_at": message.created_at,
+                "message_public_id": message.public_id,
+                "seq_in_session": message.seq_in_session,
+                "configuration": original.configuration,
             }
-            for message in created_messages
+            for message, original in zip(
+                created_messages, messages.messages, strict=True
+            )
         ]
 
         # Enqueue all messages in one call
         background_tasks.add_task(enqueue, payloads)
+
         return created_messages
     except ValueError as e:
         logger.warning(f"Failed to create messages for session {session_id}: {str(e)}")
         raise
 
 
-@router.post("/upload", response_model=list[schemas.Message])
+@router.post("/upload", response_model=list[schemas.Message], status_code=201)
 async def create_messages_with_file(
     background_tasks: BackgroundTasks,
     workspace_id: str = Path(...),
@@ -99,6 +155,9 @@ async def create_messages_with_file(
     all_message_data = await process_file_uploads_for_messages(
         file=file,
         peer_id=form_data.peer_id,
+        metadata=form_data.metadata,
+        configuration=form_data.configuration,
+        created_at=form_data.created_at,
     )
 
     # Create messages
@@ -127,31 +186,42 @@ async def create_messages_with_file(
             "content": message.content,
             "peer_name": message.peer_name,
             "created_at": message.created_at,
+            "message_public_id": message.public_id,
+            "seq_in_session": message.seq_in_session,
+            "configuration": form_data.configuration,
         }
         for message in created_messages
     ]
 
     background_tasks.add_task(enqueue, payloads)
-    logger.info(
-        f"Batch of {len(created_messages)} messages created from file uploads and queued for processing"
+    logger.debug(
+        "Batch of %s messages created from file uploads and queued for processing",
+        len(created_messages),
     )
+
+    # Prometheus metrics
+    if settings.METRICS.ENABLED:
+        prometheus_metrics.record_messages_created(
+            count=len(created_messages),
+            workspace_name=workspace_id,
+        )
 
     return created_messages
 
 
 @router.post("/list", response_model=Page[schemas.Message])
 async def get_messages(
-    workspace_id: str = Path(..., description="ID of the workspace"),
-    session_id: str = Path(..., description="ID of the session"),
+    workspace_id: str = Path(...),
+    session_id: str = Path(...),
     options: schemas.MessageGet | None = Body(
-        None, description="Filtering options for the messages list"
+        None, description="Filtering options for the message list"
     ),
     reverse: bool | None = Query(
         False, description="Whether to reverse the order of results"
     ),
     db: AsyncSession = db,
 ):
-    """Get all messages for a session"""
+    """Get all messages for a Session with optional filters. Results are paginated."""
     try:
         filters = None
         if options and hasattr(options, "filters"):
@@ -174,12 +244,12 @@ async def get_messages(
 
 @router.get("/{message_id}", response_model=schemas.Message)
 async def get_message(
-    workspace_id: str = Path(..., description="ID of the workspace"),
-    session_id: str = Path(..., description="ID of the session"),
-    message_id: str = Path(..., description="ID of the message to retrieve"),
+    workspace_id: str = Path(...),
+    session_id: str = Path(...),
+    message_id: str = Path(...),
     db: AsyncSession = db,
 ):
-    """Get a Message by ID"""
+    """Get a single message by ID from a Session."""
     honcho_message = await crud.get_message(
         db, workspace_name=workspace_id, session_name=session_id, message_id=message_id
     )
@@ -191,15 +261,19 @@ async def get_message(
 
 @router.put("/{message_id}", response_model=schemas.Message)
 async def update_message(
-    workspace_id: str = Path(..., description="ID of the workspace"),
-    session_id: str = Path(..., description="ID of the session"),
-    message_id: str = Path(..., description="ID of the message to update"),
+    workspace_id: str = Path(...),
+    session_id: str = Path(...),
+    message_id: str = Path(...),
     message: schemas.MessageUpdate = Body(
         ..., description="Updated message parameters"
     ),
     db: AsyncSession = db,
 ):
-    """Update the metadata of a Message"""
+    """
+    Update the metadata of a message.
+
+    This will overwrite any existing metadata for the message.
+    """
     try:
         updated_message = await crud.update_message(
             db,
@@ -208,7 +282,7 @@ async def update_message(
             session_name=session_id,
             message_id=message_id,
         )
-        logger.info(f"Message {message_id} updated successfully")
+        logger.debug("Message %s updated successfully", message_id)
         return updated_message
     except ValueError as e:
         logger.warning(f"Failed to update message {message_id}: {str(e)}")

@@ -5,6 +5,198 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [3.0.2] - 2026-01-27
+
+### Added
+
+- Documentation for reasoning_level and Claude Code plugin
+
+### Changed
+
+- Gave dreaming sub-agents better prompting around peer card creation, tweaked overall prompts
+
+### Fixed
+
+- Added message-search fallback for memory search tool, necessary in fresh sessions
+- Made FLUSH_ENABLED a config value
+- Removed N+1 query in search_messages
+
+## [3.0.1] - 2026-01-27
+
+### Fixed
+
+- Token counting in Explicit Agent Loop
+- Backwards compatibility of queue items
+
+## [3.0.0] - 2026-01-19
+
+### Added
+
+- Agentic Dreamer for intelligent memory consolidation using LLM agents
+- Agentic Dialectic for query answering using LLM agents with tool use
+- Reasoning levels configuration for dialectic (`minimal`, `low`, `medium`, `high`, `max`)
+- Prometheus token tracking for deriver and dialectic operations
+- n8n integration
+- Cloud Events for auditable telemetry
+- External Vector Store support for turbopuffer and lancedb with reconciliation flow
+
+### Changed
+
+- API route renaming for consistency
+- Dreamer and dialectic now respect peer card configuration settings
+- Observations renamed to Conclusions across API and SDKs
+- Deriver to buffer representation tasks to normalize workloads
+- Local Representation tasks to create singular QueueItems
+- getContext endpoint to use `search_query` rather than force `last_user_message`
+
+### Fixed
+
+- Dream scheduling bugs
+- Summary creation when start_message_id > end_message_id
+- Cashews upgrade to prevent NoScriptError
+- Memory leak in `accumulate_metric` call
+
+### Removed
+
+- Peer card configuration from message configuration; peer cards no longer created/updated in deriver process
+
+## [2.5.1] - 2025-12-15
+
+### Fixed
+
+- Backwards compatibility for `message_ids` field in documents to handle legacy tuple format
+
+## [2.5.0] - 2025-12-03
+
+### Added
+
+- Message level configurations
+- CRUD operations for observations
+- Comprehensive test cases for harness
+- Peer level get_context
+- Set Peer Card Method
+- Manual dreaming trigger endpoint
+
+### Changed
+
+- Configurations to support more flags for fine-grained control of the deriver, peer cards, summaries, etc.
+- Working Representations to support more fine-grained parameters
+
+### Fixed
+
+- File uploads to match `MessageCreate` structure
+- Cache invalidation strategy
+
+## [2.4.3] - 2025-11-20
+
+### Added
+
+- Redis caching to improve DB IO
+- Backup LLM provider to avoid failures when a provider is down
+
+### Changed
+
+- QueueItems to use standardized columns
+- Improved Deduplication logic for Representation Tasks
+- More finegrained metrics for representation, summary, and peer card tasks
+- DB constraint to follow standard naming conventions
+
+## [2.4.2] - 2025-11-03
+
+### Fixed
+
+- Langfuse tracing to have readable waterfalls
+- Alembic Migrations to match models.py
+- message_in_seq correctly included in webhook payload
+
+### Changed
+
+- Alembic to always use a session pooler
+- Statement timeout during alembic operations to 5 min
+
+## [2.4.1] - 2025-10-24
+
+### Added
+
+- Alembic migration validation test suite
+
+### Fixed
+
+- Alembic migrations to batch changes
+- Batch message creation sequence number
+
+### Changed
+
+- Logging infrastructure to remove noisy messages
+- Sentry integration is centralized
+
+## [2.4.0] - 2025-10-09
+
+### Added
+
+- Unified `Representation` class
+- vllm client support
+- Periodic queue cleanup logic
+- WIP Dreaming Feature
+- LongMemEval to Test Bench
+- Prometheus Client for better Metrics
+- Performance metrics instrumentation
+- Error reporting to deriver
+- Workspace Delete Method
+- Multi-db option in test harness
+
+### Changed
+
+- Working Representations are Queried on the fly rather than cached in metadata
+- EmbeddingStore to RepresentationFactory
+- Summary Response Model to use public_id of message for cutoff
+- Semantic across codebase to reference resources based on `observer` and `observed`
+- Prompts for Deriver & Dialectic to reference peer_id and add examples
+- `Get Context` route returns peer card and representation in addition to messages and summaries
+- Refactoring logger.info calls to logger.debug where applicable
+
+### Fixed
+
+- Gemini client to use async methods
+
+## [2.3.3] — 2025-10-01
+
+### Changed
+
+- Deriver Rollup Queue processes interleaved messages for more context
+
+### Fixed
+
+- Dialectic Streaming to follow SSE conventions
+- Sentry tracing in the deriver
+
+## [2.3.2] — 2025-09-25
+
+### Added
+
+- Get peer cards endpoint (`GET /v2/peers/{peer_id}/card`) for retrieving targeted peer context information
+
+### Changed
+
+- Replaced Mirascope dependency with small client implementation for better control
+- Optimized deriver performance by using joins on messages table instead of storing token count in queue payload
+- Database scope optimization for various operations
+- Batch representation task processing for ~10x speed improvement in practice
+
+### Fixed
+
+- Separated clean and claim work units in queue manager to prevent race conditions
+- Skip locked ActiveQueueSession rows on delete operations
+- Langfuse SDK integration updates for compatibility
+- Added configurable maximum message size to prevent token overflow in deriver
+- Various minor bugfixes
+
+## [2.3.1] - 2025-09-18
+
+### Fixed
+
+- Added max message count to deriver in order to not overflow token limits
+
 ## [2.3.0] — 2025-08-14
 
 ### Added

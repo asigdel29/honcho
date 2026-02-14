@@ -1,14 +1,22 @@
+from dataclasses import dataclass
 from logging import getLogger
 from typing import Any
 
+from cashews import NOT_NONE
 from nanoid import generate as generate_nanoid
-from sqlalchemy import Select, case, cast, func, insert, select, update
+from sqlalchemy import Select, and_, case, cast, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import BigInteger, Boolean
 
 from src import models, schemas
+from src.cache.client import (
+    cache,
+    get_cache_namespace,
+    safe_cache_delete,
+    safe_cache_set,
+)
 from src.config import settings
 from src.exceptions import (
     ConflictException,
@@ -16,13 +24,60 @@ from src.exceptions import (
     ResourceNotFoundException,
 )
 from src.utils.filter import apply_filter
+from src.utils.types import GetOrCreateResult
+from src.vector_store import get_external_vector_store
 
 from .peer import get_or_create_peers, get_peer
-
-# Import workspace and peer functions that are needed
 from .workspace import get_or_create_workspace
 
 logger = getLogger(__name__)
+
+
+@dataclass
+class SessionDeletionResult:
+    """Result of a session deletion including cascade counts."""
+
+    messages_deleted: int
+    conclusions_deleted: int
+
+
+SESSION_CACHE_KEY_TEMPLATE = "workspace:{workspace_name}:session:{session_name}"
+SESSION_LOCK_PREFIX = f"{get_cache_namespace()}:lock"
+
+
+def session_cache_key(workspace_name: str, session_name: str) -> str:
+    """Generate cache key for session."""
+    return (
+        get_cache_namespace()
+        + ":"
+        + SESSION_CACHE_KEY_TEMPLATE.format(
+            workspace_name=workspace_name,
+            session_name=session_name,
+        )
+    )
+
+
+@cache(
+    key=SESSION_CACHE_KEY_TEMPLATE,
+    ttl=f"{settings.CACHE.DEFAULT_TTL_SECONDS}s",
+    prefix=get_cache_namespace(),
+    condition=NOT_NONE,
+)
+@cache.locked(
+    key=SESSION_CACHE_KEY_TEMPLATE,
+    ttl=f"{settings.CACHE.DEFAULT_LOCK_TTL_SECONDS}s",
+    prefix=SESSION_LOCK_PREFIX,
+)
+async def _fetch_session(
+    db: AsyncSession,
+    workspace_name: str,
+    session_name: str,
+) -> models.Session | None:
+    return await db.scalar(
+        select(models.Session)
+        .where(models.Session.workspace_name == workspace_name)
+        .where(models.Session.name == session_name)
+    )
 
 
 def count_observers_in_config(
@@ -45,9 +100,13 @@ async def get_sessions(
     filters: dict[str, Any] | None = None,
 ) -> Select[tuple[models.Session]]:
     """
-    Get all sessions in a workspace.
+    Get all active sessions in a workspace.
     """
-    stmt = select(models.Session).where(models.Session.workspace_name == workspace_name)
+    stmt = (
+        select(models.Session)
+        .where(models.Session.workspace_name == workspace_name)
+        .where(models.Session.is_active == True)  # noqa: E712
+    )
 
     stmt = apply_filter(stmt, models.Session, filters)
 
@@ -60,7 +119,7 @@ async def get_or_create_session(
     workspace_name: str,
     *,
     _retry: bool = False,
-) -> models.Session:
+) -> GetOrCreateResult[models.Session]:
     """
     Get or create a session in a workspace with specified peers.
     If the session already exists, the peers are added to the session.
@@ -72,22 +131,31 @@ async def get_or_create_session(
         peer_names: List of peer names to add to the session
         _retry: Whether to retry the operation
     Returns:
-        The created session
+        GetOrCreateResult containing the session and whether it was created
 
     Raises:
         ResourceNotFoundException: If the session does not exist and create is false
         ConflictException: If we fail to get or create the session
     """
 
-    stmt = (
-        select(models.Session)
-        .where(models.Session.workspace_name == workspace_name)
-        .where(models.Session.name == session.name)
-    )
+    if not session.name:
+        raise ValueError("Session name must be provided")
 
-    result = await db.execute(stmt)
+    honcho_session = await _fetch_session(db, workspace_name, session.name)
 
-    honcho_session = result.scalar_one_or_none()
+    # Merge cached object into session if it exists (cached objects are detached)
+    if honcho_session is not None:
+        honcho_session = await db.merge(honcho_session, load=False)
+
+        # Reject operations on inactive sessions (marked for deletion)
+        if not honcho_session.is_active:
+            raise ResourceNotFoundException(
+                f"Session {session.name} not found in workspace {workspace_name}"
+            )
+
+    # Track if we need to update cache and if session was created
+    needs_cache_update = False
+    created = False
 
     # Check if session already exists
     if honcho_session is None:
@@ -108,16 +176,21 @@ async def get_or_create_session(
             workspace_name=workspace_name,
             name=session.name,
             h_metadata=session.metadata or {},
-            configuration=session.configuration or {},
+            configuration=session.configuration.model_dump(exclude_none=True)
+            if session.configuration
+            else {},
         )
         try:
             db.add(honcho_session)
-            # Flush to ensure session exists in DB before adding peers
+            # Flush to ensure session exists in DB before adding peers and set flag to warm cache
             await db.flush()
+            needs_cache_update = True
+            created = True
+
         except IntegrityError:
             await db.rollback()
             logger.debug(
-                f"Race condition detected for session: {session.name}, retrying get"
+                "Race condition detected for session: %s, retrying get", session.name
             )
             if _retry:
                 raise ConflictException(
@@ -126,10 +199,20 @@ async def get_or_create_session(
             return await get_or_create_session(db, session, workspace_name, _retry=True)
     else:
         # Update existing session with metadata and feature flags if provided
-        if session.metadata is not None:
+        if (
+            session.metadata is not None
+            and honcho_session.h_metadata != session.metadata
+        ):
             honcho_session.h_metadata = session.metadata
+            needs_cache_update = True
         if session.configuration is not None:
-            honcho_session.configuration = session.configuration
+            # Merge configuration instead of replacing to preserve existing keys
+            existing_config = (honcho_session.configuration or {}).copy()
+            incoming_config = session.configuration.model_dump(exclude_none=True)
+            merged_config = {**existing_config, **incoming_config}
+            if honcho_session.configuration != merged_config:
+                honcho_session.configuration = merged_config
+                needs_cache_update = True
 
     # Add all peers to session
     if session.peer_names:
@@ -148,13 +231,27 @@ async def get_or_create_session(
         )
 
     await db.commit()
-    return honcho_session
+    await db.refresh(honcho_session)
+
+    # Only update cache if session data changed or was newly created
+    if needs_cache_update:
+        cache_key = session_cache_key(workspace_name, session.name)
+        await safe_cache_set(
+            cache_key, honcho_session, expire=settings.CACHE.DEFAULT_TTL_SECONDS
+        )
+        logger.debug(
+            "Session %s cache updated in workspace %s", session.name, workspace_name
+        )
+
+    return GetOrCreateResult(honcho_session, created=created)
 
 
 async def get_session(
     db: AsyncSession,
     session_name: str,
     workspace_name: str,
+    *,
+    include_inactive: bool = False,
 ) -> models.Session:
     """
     Get a session in a workspace.
@@ -163,29 +260,32 @@ async def get_session(
         db: Database session
         session_name: Name of the session
         workspace_name: Name of the workspace
+        include_inactive: If True, return sessions even if they are marked for deletion.
+            This should only be used for internal operations like the deletion task.
 
     Returns:
         The session
 
     Raises:
-        ResourceNotFoundException: If the session does not exist
+        ResourceNotFoundException: If the session does not exist or is inactive
     """
-    stmt = (
-        select(models.Session)
-        .where(models.Session.workspace_name == workspace_name)
-        .where(models.Session.name == session_name)
-    )
+    session = await _fetch_session(db, workspace_name, session_name)
 
-    result = await db.execute(stmt)
-
-    honcho_session = result.scalar_one_or_none()
-
-    if honcho_session is None:
+    if session is None:
         raise ResourceNotFoundException(
             f"Session {session_name} not found in workspace {workspace_name}"
         )
 
-    return honcho_session
+    # Check if session is active (unless include_inactive is True)
+    if not include_inactive and not session.is_active:
+        raise ResourceNotFoundException(
+            f"Session {session_name} not found in workspace {workspace_name}"
+        )
+
+    # Merge cached object into session (cached objects are detached)
+    session = await db.merge(session, load=False)
+
+    return session
 
 
 async def update_session(
@@ -209,26 +309,99 @@ async def update_session(
     Raises:
         ResourceNotFoundException: If the session does not exist or peer is not in session
     """
-    honcho_session = await get_or_create_session(
-        db, schemas.SessionCreate(name=session_name), workspace_name=workspace_name
-    )
+    honcho_session: models.Session = (
+        await get_or_create_session(
+            db, schemas.SessionCreate(name=session_name), workspace_name=workspace_name
+        )
+    ).resource
 
-    if session.metadata is not None:
+    # Track if anything changed
+    needs_update = False
+
+    if session.metadata is not None and honcho_session.h_metadata != session.metadata:
         honcho_session.h_metadata = session.metadata
+        needs_update = True
 
     if session.configuration is not None:
-        honcho_session.configuration = session.configuration
+        # Merge configuration instead of replacing to preserve existing keys
+        base_config = (honcho_session.configuration or {}).copy()
+        merged_config = {
+            **base_config,
+            **session.configuration.model_dump(exclude_none=True),
+        }
+        if honcho_session.configuration != merged_config:
+            honcho_session.configuration = merged_config
+            needs_update = True
+
+    if not needs_update:
+        logger.debug(
+            "Session %s unchanged in workspace %s, skipping update",
+            session_name,
+            workspace_name,
+        )
+        return honcho_session
 
     await db.commit()
-    logger.info(f"Session {session_name} updated successfully")
+    await db.refresh(honcho_session)
+
+    # Only invalidate if we actually updated
+    cache_key = session_cache_key(workspace_name, session_name)
+    await safe_cache_delete(cache_key)
+
+    logger.debug("Session %s updated successfully", session_name)
     return honcho_session
+
+
+async def _batch_delete_matching(
+    db: AsyncSession,
+    model: Any,
+    filter_conditions: list[Any],
+    batch_size: int = 5000,
+) -> int:
+    """
+    Delete records in batches that match the given filter conditions.
+
+    Args:
+        db: Database session
+        model: SQLAlchemy model class
+        filter_conditions: List of SQLAlchemy filter conditions
+        batch_size: Number of records to delete per batch
+
+    Returns:
+        Total number of records deleted
+    """
+    total_deleted = 0
+    primary_key_column = model.__table__.primary_key.columns.values()[0]
+
+    while True:
+        subquery = (
+            select(primary_key_column).where(and_(*filter_conditions)).limit(batch_size)
+        )
+        delete_stmt = delete(model).where(primary_key_column.in_(subquery))
+        delete_result = await db.execute(delete_stmt)
+        batch_deleted = delete_result.rowcount or 0
+        total_deleted += batch_deleted
+
+        if batch_deleted == 0:
+            break
+
+    return total_deleted
 
 
 async def delete_session(
     db: AsyncSession, workspace_name: str, session_name: str
-) -> bool:
+) -> SessionDeletionResult:
     """
-    Mark a session as inactive (soft delete).
+    Delete a session and all associated data (hard delete).
+
+    This performs cascading deletes for all session-related data including:
+    - Active queue sessions
+    - Queue items
+    - Message embeddings (batched)
+    - Documents (theory-of-mind data, batched)
+    - Messages (batched)
+    - Session peer associations
+    - The session itself
 
     Args:
         db: Database session
@@ -236,29 +409,176 @@ async def delete_session(
         session_name: Name of the session
 
     Returns:
-        True if the session was deleted successfully
+        SessionDeletionResult containing cascade counts
 
     Raises:
         ResourceNotFoundException: If the session does not exist
     """
-    stmt = (
-        select(models.Session)
-        .where(models.Session.workspace_name == workspace_name)
-        .where(models.Session.name == session_name)
+    honcho_session = await get_session(
+        db, session_name, workspace_name, include_inactive=True
     )
-    result = await db.execute(stmt)
-    honcho_session = result.scalar_one_or_none()
 
-    if honcho_session is None:
-        logger.warning(
-            f"Session {session_name} not found in workspace {workspace_name}"
+    # Perform cascading deletes in order
+    # Order is important to avoid foreign key constraint violations
+    try:
+        # Delete ActiveQueueSession entries
+        # Work unit keys have format: {task_type}:{workspace_name}:{session_name}:{...}
+        await db.execute(
+            delete(models.ActiveQueueSession).where(
+                and_(
+                    func.split_part(models.ActiveQueueSession.work_unit_key, ":", 2)
+                    == workspace_name,
+                    func.split_part(models.ActiveQueueSession.work_unit_key, ":", 3)
+                    == session_name,
+                )
+            )
         )
-        raise ResourceNotFoundException("Session not found")
 
-    honcho_session.is_active = False
-    await db.commit()
-    logger.info(f"Session {session_name} marked as inactive")
-    return True
+        # Delete QueueItem entries
+        await db.execute(
+            delete(models.QueueItem).where(
+                models.QueueItem.session_id == honcho_session.id
+            )
+        )
+
+        # Delete message vectors from vector store before deleting DB records
+        # Fetch all MessageEmbedding records to build vector IDs with {message_id}_{chunk_index}
+        embedding_result = await db.execute(
+            select(models.MessageEmbedding).where(
+                models.MessageEmbedding.session_name == session_name,
+                models.MessageEmbedding.workspace_name == workspace_name,
+            )
+        )
+        embeddings = list(embedding_result.scalars().all())
+        external_vector_store = get_external_vector_store()
+
+        # Only delete from external vector store if one exists
+        if external_vector_store is not None and embeddings:
+            # Compute chunk_index for each embedding based on message_id ordering
+            message_chunks: dict[str, list[models.MessageEmbedding]] = {}
+            for emb in embeddings:
+                message_chunks.setdefault(emb.message_id, []).append(emb)
+
+            # Sort each message's chunks by id and build vector IDs
+            vector_ids: list[str] = []
+            for chunks in message_chunks.values():
+                chunks.sort(key=lambda e: e.id)
+                for chunk_idx, chunk in enumerate(chunks):
+                    vector_ids.append(f"{chunk.message_id}_{chunk_idx}")
+
+            # Try to delete from external vector store (best effort)
+            try:
+                namespace = external_vector_store.get_vector_namespace(
+                    "message", workspace_name
+                )
+                await external_vector_store.delete_many(namespace, vector_ids)
+                logger.debug(
+                    f"Deleted {len(vector_ids)} message vectors for session {session_name}"
+                )
+            except Exception as e:
+                # Log warning but continue - workspace deletion will clean up eventually
+                logger.warning(
+                    f"Failed to delete message vectors for session {session_name}: {e}"
+                )
+
+        # Delete MessageEmbedding entries in batches
+        await _batch_delete_matching(
+            db,
+            models.MessageEmbedding,
+            [
+                models.MessageEmbedding.session_name == session_name,
+                models.MessageEmbedding.workspace_name == workspace_name,
+            ],
+            batch_size=5000,
+        )
+
+        # Delete document vectors from vector store before deleting DB records
+        # Fetch all Document records to get IDs and namespaces
+        doc_result = await db.execute(
+            select(
+                models.Document.id,
+                models.Document.observer,
+                models.Document.observed,
+            ).where(
+                models.Document.session_name == session_name,
+                models.Document.workspace_name == workspace_name,
+            )
+        )
+        documents = doc_result.all()
+
+        # Only delete from external vector store if one exists
+        if external_vector_store is not None and documents:
+            # Group document IDs by namespace (observer/observed)
+            docs_by_namespace: dict[str, list[str]] = {}
+            for doc in documents:
+                namespace = external_vector_store.get_vector_namespace(
+                    "document",
+                    workspace_name,
+                    doc.observer,
+                    doc.observed,
+                )
+                docs_by_namespace.setdefault(namespace, []).append(doc.id)
+
+            # Try to delete from external vector store (best effort, per namespace)
+            for namespace, doc_ids in docs_by_namespace.items():
+                try:
+                    await external_vector_store.delete_many(namespace, doc_ids)
+                    logger.debug(
+                        f"Deleted {len(doc_ids)} document vectors from {namespace}"
+                    )
+                except Exception as e:
+                    # Log warning but continue - workspace deletion will clean up eventually
+                    logger.warning(
+                        f"Failed to delete document vectors from {namespace}: {e}"
+                    )
+
+        # Delete Document entries associated with this session in batches
+        conclusions_deleted = await _batch_delete_matching(
+            db,
+            models.Document,
+            [
+                models.Document.session_name == session_name,
+                models.Document.workspace_name == workspace_name,
+            ],
+            batch_size=5000,
+        )
+
+        # Delete Message entries in batches
+        messages_deleted = await _batch_delete_matching(
+            db,
+            models.Message,
+            [
+                models.Message.session_name == session_name,
+                models.Message.workspace_name == workspace_name,
+            ],
+            batch_size=5000,
+        )
+
+        # Delete SessionPeer associations
+        await db.execute(
+            delete(models.SessionPeer).where(
+                models.SessionPeer.session_name == session_name,
+                models.SessionPeer.workspace_name == workspace_name,
+            )
+        )
+
+        # Finally, delete the session itself
+        await db.delete(honcho_session)
+        await db.commit()
+
+        # Invalidate session cache
+        await safe_cache_delete(session_cache_key(workspace_name, session_name))
+
+        logger.debug("Session %s and all associated data deleted", session_name)
+    except Exception as e:
+        logger.error("Failed to delete session %s: %s", session_name, e)
+        await db.rollback()
+        raise e
+
+    return SessionDeletionResult(
+        messages_deleted=messages_deleted,
+        conclusions_deleted=conclusions_deleted,
+    )
 
 
 async def clone_session(
@@ -268,8 +588,16 @@ async def clone_session(
     cutoff_message_id: str | None = None,
 ) -> models.Session:
     """
-    Clone a session and its messages. If cutoff_message_id is provided,
+    Clone a session and its data. If cutoff_message_id is provided,
     only clone messages up to and including that message.
+
+    The following data is copied to the new session:
+    - Session metadata
+    - Session configuration
+    - All messages (or up to cutoff_message_id) with their content, metadata, and peer associations
+    - Session-peer associations with their configurations (observe_me, observe_others)
+
+    The new session gets a unique ID (nanoid) and fresh timestamps.
 
     Args:
         db: SQLAlchemy session
@@ -280,11 +608,12 @@ async def clone_session(
     Returns:
         The newly created session
     """
-    # Get the original session
+    # Get the original session (must be active)
     stmt = (
         select(models.Session)
         .where(models.Session.workspace_name == workspace_name)
         .where(models.Session.name == original_session_name)
+        .where(models.Session.is_active == True)  # noqa: E712
     )
     result = await db.execute(stmt)
     original_session = result.scalar_one_or_none()
@@ -309,6 +638,7 @@ async def clone_session(
         workspace_name=workspace_name,
         name=generate_nanoid(),
         h_metadata=original_session.h_metadata,
+        configuration=original_session.configuration,
     )
     db.add(new_session)
     await db.flush()  # Flush to get the new session ID
@@ -336,6 +666,7 @@ async def clone_session(
             "h_metadata": message.h_metadata,
             "workspace_name": workspace_name,
             "peer_name": message.peer_name,
+            "seq_in_session": message.seq_in_session,
         }
         for message in messages_to_clone
     ]
@@ -343,7 +674,7 @@ async def clone_session(
     insert_stmt = insert(models.Message).returning(models.Message)
     result = await db.execute(insert_stmt, new_messages)
 
-    # Clone peers from original session to new session
+    # Clone peers from original session to new session (including their configurations)
     stmt = select(models.SessionPeer).where(
         models.SessionPeer.session_name == original_session_name
     )
@@ -354,11 +685,15 @@ async def clone_session(
             session_name=new_session.name,
             peer_name=session_peer.peer_name,
             workspace_name=workspace_name,
+            configuration=session_peer.configuration,
         )
         db.add(new_session_peer)
 
     await db.commit()
-    logger.info(f"Session {original_session_name} cloned successfully")
+    await db.refresh(new_session)
+    logger.debug("Session %s cloned successfully", original_session_name)
+
+    # Cache will be populated on next read - read-through pattern
     return new_session
 
 
@@ -384,18 +719,7 @@ async def remove_peers_from_session(
         ResourceNotFoundException: If the session does not exist
     """
     # Verify session exists
-    stmt = (
-        select(models.Session)
-        .where(models.Session.workspace_name == workspace_name)
-        .where(models.Session.name == session_name)
-    )
-    result = await db.execute(stmt)
-    session = result.scalar_one_or_none()
-
-    if session is None:
-        raise ResourceNotFoundException(
-            f"Session {session_name} not found in workspace {workspace_name}"
-        )
+    await get_session(db, session_name, workspace_name)
 
     # Soft delete specified session peers by setting left_at timestamp
     update_stmt = (
@@ -408,7 +732,7 @@ async def remove_peers_from_session(
         )
         .values(left_at=func.now())
     )
-    result = await db.execute(update_stmt)
+    await db.execute(update_stmt)
 
     await db.commit()
     return True

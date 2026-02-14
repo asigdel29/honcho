@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Body, Depends, Path
+from fastapi import APIRouter, Body, Depends, Path, Response
 from fastapi_pagination import Page
 from fastapi_pagination.ext.sqlalchemy import apaginate
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,7 @@ router = APIRouter(
 
 @router.post("", response_model=schemas.WebhookEndpoint)
 async def get_or_create_webhook_endpoint(
+    response: Response,
     workspace_id: str = Path(..., description="Workspace ID"),
     webhook: schemas.WebhookEndpointCreate = Body(
         ..., description="Webhook endpoint parameters"
@@ -40,9 +41,11 @@ async def get_or_create_webhook_endpoint(
         raise AuthenticationException("Unauthorized access to resource")
 
     try:
-        return await crud.get_or_create_webhook_endpoint(
+        result = await crud.get_or_create_webhook_endpoint(
             db, workspace_id, webhook=webhook
         )
+        response.status_code = 201 if result.created else 200
+        return result.resource
     except ValueError as e:
         raise ConflictException(
             f"Maximum number of webhook endpoints ({settings.WEBHOOK.MAX_WORKSPACE_LIMIT}) reached for this workspace."
@@ -61,11 +64,11 @@ async def list_webhook_endpoints(
     if not jwt_params.ad and jwt_params.w is not None and jwt_params.w != workspace_id:
         raise AuthenticationException("Unauthorized access to resource")
 
-    stmt = await crud.list_webhook_endpoints(db, workspace_id)
+    stmt = await crud.list_webhook_endpoints(workspace_id)
     return await apaginate(db, stmt)
 
 
-@router.delete("/{endpoint_id}", response_model=None)
+@router.delete("/{endpoint_id}", response_model=None, status_code=204)
 async def delete_webhook_endpoint(
     workspace_id: str = Path(..., description="Workspace ID"),
     endpoint_id: str = Path(..., description="Webhook endpoint ID"),

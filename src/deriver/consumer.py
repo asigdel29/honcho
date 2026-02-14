@@ -1,105 +1,371 @@
 import logging
-from typing import Any
+import time
 
 import sentry_sdk
-from langfuse.decorators import langfuse_context
 from pydantic import ValidationError
-from rich.console import Console
+from sqlalchemy import select
 
-from src.config import settings
+from src import crud, models
 from src.dependencies import tracked_db
-from src.deriver import deriver
+from src.deriver.deriver import process_representation_tasks_batch
+from src.dreamer import process_dream
+from src.exceptions import ResourceNotFoundException
+from src.models import Message
+from src.reconciler.queue_cleanup import cleanup_queue_items
+from src.reconciler.sync_vectors import run_vector_reconciliation_cycle
+from src.schemas import ReconcilerType, ResolvedConfiguration
+from src.telemetry.events import (
+    CleanupStaleItemsCompletedEvent,
+    DeletionCompletedEvent,
+    SyncVectorsCompletedEvent,
+    emit,
+)
+from src.telemetry.logging import log_performance_metrics
 from src.utils import summarizer
-from src.utils.logging import log_performance_metrics
-from src.webhooks import webhook_delivery
-
-from .queue_payload import (
-    RepresentationPayload,
+from src.utils.queue_payload import (
+    DeletionPayload,
+    DreamPayload,
+    ReconcilerPayload,
     SummaryPayload,
     WebhookPayload,
 )
+from src.webhooks import webhook_delivery
 
 logger = logging.getLogger(__name__)
 logging.getLogger("sqlalchemy.engine.Engine").disabled = True
 
-console = Console(markup=True)
 
+async def process_item(queue_item: models.QueueItem) -> None:
+    """Process a single item from the queue."""
+    task_type = queue_item.task_type
+    queue_payload = queue_item.payload
+    workspace_name = queue_item.workspace_name
 
-async def process_item(task_type: str, payload: dict[str, Any]) -> None:
-    """Validate an incoming queue payload and dispatch it to the appropriate handler.
+    # Handle reconciler first - it's the only task type that doesn't require workspace_name
+    if task_type == "reconciler":
+        with sentry_sdk.start_transaction(name="process_reconciler_task", op="deriver"):
+            try:
+                validated = ReconcilerPayload(**queue_payload)
+            except ValidationError as e:
+                logger.error(
+                    "Invalid reconciler payload received: %s. Payload: %s",
+                    str(e),
+                    queue_payload,
+                )
+                raise ValueError(f"Invalid payload structure: {str(e)}") from e
+            await process_reconciler(validated)
+        return
 
-    This function centralizes payload validation using a simple mapping from
-    task type to Pydantic model. After validation, it routes the request to
-    the correct processor without repeating type checks elsewhere.
-    """
-    logger.debug("process_item received payload for task type %s", task_type)
+    # All other task types require a workspace_name
+    if workspace_name is None:
+        raise ValueError(f"{task_type} tasks require a workspace_name")
 
     if task_type == "webhook":
         try:
-            validated = WebhookPayload(**payload)
+            validated = WebhookPayload(**queue_payload)
         except ValidationError as e:
             logger.error(
-                "Invalid webhook payload received: %s. Payload: %s", str(e), payload
-            )
-            raise ValueError(f"Invalid payload structure: {str(e)}") from e
-        await process_webhook(validated)
-        logger.debug("Finished processing webhook %s", validated.event_type)
-    elif task_type == "summary":
-        if settings.LANGFUSE_PUBLIC_KEY:
-            langfuse_context.update_current_trace(  # type: ignore
-                metadata={
-                    "critical_analysis_model": settings.DERIVER.MODEL,
-                }
-            )
-        try:
-            validated = SummaryPayload(**payload)
-        except ValidationError as e:
-            logger.error(
-                "Invalid summary payload received: %s. Payload: %s", str(e), payload
-            )
-            raise ValueError(f"Invalid payload structure: {str(e)}") from e
-        await process_summary_task(validated)
-    elif task_type == "representation":
-        if settings.LANGFUSE_PUBLIC_KEY:
-            langfuse_context.update_current_trace(
-                metadata={
-                    "critical_analysis_model": settings.DERIVER.MODEL,
-                }
-            )
-
-        try:
-            validated = RepresentationPayload(**payload)
-        except ValidationError as e:
-            logger.error(
-                "Invalid representation payload received: %s. Payload: %s",
+                "Invalid webhook payload received: %s. Payload: %s",
                 str(e),
-                payload,
+                queue_payload,
             )
             raise ValueError(f"Invalid payload structure: {str(e)}") from e
-        await deriver.process_representation_task(validated)
+        async with tracked_db() as db:
+            await webhook_delivery.deliver_webhook(db, validated, workspace_name)
+
+    elif task_type == "summary":
+        try:
+            validated = SummaryPayload(**queue_payload)
+        except ValidationError as e:
+            logger.error(
+                "Invalid summary payload received: %s. Payload: %s",
+                str(e),
+                queue_payload,
+            )
+            raise ValueError(f"Invalid payload structure: {str(e)}") from e
+
+        # Use workspace_name and message_id from QueueItem columns
+        message_id = queue_item.message_id
+
+        if message_id is None:
+            raise ValueError("Summary tasks require a message_id")
+
+        message_public_id = validated.message_public_id
+        if not message_public_id:
+            logger.debug("Fetching message public ID for message %s", message_id)
+            async with tracked_db(operation_name="summary_fallback") as db:
+                stmt = (
+                    select(models.Message)
+                    .where(models.Message.workspace_name == workspace_name)
+                    .where(models.Message.session_name == validated.session_name)
+                    .where(models.Message.id == message_id)
+                )
+                result = await db.execute(stmt)
+
+                message = result.scalar_one_or_none()
+                if message is None:
+                    logger.error(
+                        "Failed to fetch message with ID %s for process_summary_task",
+                        message_id,
+                    )
+                    return
+                message_public_id = message.public_id
+
+        with sentry_sdk.start_transaction(name="process_summary_task", op="deriver"):
+            await summarizer.summarize_if_needed(
+                workspace_name,
+                validated.session_name,
+                message_id,
+                validated.message_seq_in_session,
+                message_public_id,
+                validated.configuration,
+            )
+            log_performance_metrics("summary", f"{workspace_name}_{message_id}")
+
+    elif task_type == "dream":
+        with sentry_sdk.start_transaction(name="process_dream_task", op="deriver"):
+            try:
+                validated = DreamPayload(**queue_payload)
+            except ValidationError as e:
+                logger.error(
+                    "Invalid dream payload received: %s. Payload: %s",
+                    str(e),
+                    queue_payload,
+                )
+                raise ValueError(f"Invalid payload structure: {str(e)}") from e
+            await process_dream(validated, workspace_name)
+
+    elif task_type == "deletion":
+        with sentry_sdk.start_transaction(name="process_deletion_task", op="deriver"):
+            try:
+                validated = DeletionPayload(**queue_payload)
+            except ValidationError as e:
+                logger.error(
+                    "Invalid deletion payload received: %s. Payload: %s",
+                    str(e),
+                    queue_payload,
+                )
+                raise ValueError(f"Invalid payload structure: {str(e)}") from e
+            await process_deletion(validated, workspace_name)
+
     else:
         raise ValueError(f"Invalid task type: {task_type}")
 
 
-@sentry_sdk.trace
-async def process_webhook(
-    payload: WebhookPayload,
-) -> None:
-    async with tracked_db() as db:
-        await webhook_delivery.deliver_webhook(db, payload)
-
-
-@sentry_sdk.trace
-async def process_summary_task(
-    payload: SummaryPayload,
+async def process_representation_batch(
+    messages: list[Message],
+    message_level_configuration: ResolvedConfiguration | None,
+    *,
+    observers: list[str] | None,
+    observed: str | None,
+    queue_item_message_ids: list[int],
 ) -> None:
     """
-    Process a summary task by generating summaries if needed.
+    Prepares and processes a batch of messages for representation tasks.
+
+    Args:
+        messages: List of messages to process
+        message_level_configuration: Resolved configuration for this batch
+        observers: List of observers for the messages
+        observed: The observed of the messages
+        queue_item_message_ids: Message IDs from queue items
     """
-    await summarizer.summarize_if_needed(
-        payload.workspace_name,
-        payload.session_name,
-        payload.message_id,
-        payload.message_seq_in_session,
+    if not messages or not messages[0]:
+        logger.debug("process_representation_batch received no messages")
+        return
+
+    if observed is None or observers is None or len(observers) == 0:
+        raise ValueError("observed and observers are required for representation tasks")
+
+    await process_representation_tasks_batch(
+        messages,
+        message_level_configuration,
+        observers=observers,
+        observed=observed,
+        queue_item_message_ids=queue_item_message_ids,
     )
-    log_performance_metrics(f"summary_{payload.workspace_name}_{payload.message_id}")
+
+
+async def process_deletion(
+    payload: DeletionPayload,
+    workspace_name: str,
+) -> None:
+    """
+    Process a deletion task from the queue.
+
+    This function handles the actual deletion of resources based on the deletion type.
+    It is designed to be idempotent - deleting an already-deleted resource is a no-op.
+
+    Args:
+        payload: The deletion payload containing deletion_type and resource_id
+        workspace_name: The workspace name for scoping the deletion
+
+    Raises:
+        ValueError: If the deletion type is not supported
+    """
+    deletion_type = payload.deletion_type
+    resource_id = payload.resource_id
+    success = True
+    error_message: str | None = None
+    peers_deleted = 0
+    sessions_deleted = 0
+    messages_deleted = 0
+    conclusions_deleted = 0
+
+    logger.info(
+        "Processing deletion task: type=%s, resource_id=%s, workspace=%s",
+        deletion_type,
+        resource_id,
+        workspace_name,
+    )
+
+    async with tracked_db("process_deletion") as db:
+        if deletion_type == "session":
+            try:
+                result = await crud.delete_session(
+                    db, workspace_name=workspace_name, session_name=resource_id
+                )
+                messages_deleted = result.messages_deleted
+                conclusions_deleted = result.conclusions_deleted
+                logger.info(
+                    "Successfully deleted session %s in workspace %s "
+                    + "(messages=%d, conclusions=%d)",
+                    resource_id,
+                    workspace_name,
+                    messages_deleted,
+                    conclusions_deleted,
+                )
+            except ResourceNotFoundException as e:
+                # Session not found - may have already been deleted, treat as success
+                logger.warning(
+                    "Session %s not found during deletion (may already be deleted): %s",
+                    resource_id,
+                    str(e),
+                )
+
+        elif deletion_type == "observation":
+            try:
+                await crud.delete_document_by_id(
+                    db, workspace_name=workspace_name, document_id=resource_id
+                )
+                conclusions_deleted = 1  # Single observation deleted
+                logger.info(
+                    "Successfully deleted observation %s in workspace %s",
+                    resource_id,
+                    workspace_name,
+                )
+            except ResourceNotFoundException as e:
+                # Document not found - may have already been deleted, treat as success
+                logger.warning(
+                    "Observation %s not found during deletion (may already be deleted): %s",
+                    resource_id,
+                    str(e),
+                )
+
+        elif deletion_type == "workspace":
+            try:
+                result = await crud.delete_workspace(db, workspace_name=workspace_name)
+                peers_deleted = result.peers_deleted
+                sessions_deleted = result.sessions_deleted
+                messages_deleted = result.messages_deleted
+                conclusions_deleted = result.conclusions_deleted
+                logger.info(
+                    "Successfully deleted workspace %s "
+                    + "(peers=%d, sessions=%d, messages=%d, conclusions=%d)",
+                    workspace_name,
+                    peers_deleted,
+                    sessions_deleted,
+                    messages_deleted,
+                    conclusions_deleted,
+                )
+            except ResourceNotFoundException as e:
+                # Workspace not found - may have already been deleted, treat as success
+                logger.warning(
+                    "Workspace %s not found during deletion (may already be deleted): %s",
+                    workspace_name,
+                    str(e),
+                )
+
+        else:
+            success = False
+            error_message = f"Unsupported deletion type: {deletion_type}"
+            raise ValueError(error_message)
+
+    # Emit telemetry event
+    emit(
+        DeletionCompletedEvent(
+            workspace_name=workspace_name,
+            deletion_type=deletion_type,
+            resource_id=resource_id,
+            success=success,
+            peers_deleted=peers_deleted,
+            sessions_deleted=sessions_deleted,
+            messages_deleted=messages_deleted,
+            conclusions_deleted=conclusions_deleted,
+            error_message=error_message,
+        )
+    )
+
+
+async def process_reconciler(payload: ReconcilerPayload) -> None:
+    """
+    Process a reconciler task from the queue.
+
+    Currently supports:
+    - sync_vectors: Syncs pending documents/message embeddings to vector store
+      and cleans up soft-deleted documents.
+    - cleanup_queue: Removes old processed queue items.
+
+    Args:
+        payload: The reconciler payload containing the reconciler type
+    """
+    reconciler_type = payload.reconciler_type
+    start_time = time.perf_counter()
+
+    if reconciler_type == ReconcilerType.SYNC_VECTORS:
+        logger.debug("Processing sync_vectors task")
+        metrics = await run_vector_reconciliation_cycle()
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
+        if (
+            metrics.total_synced > 0
+            or metrics.total_failed > 0
+            or metrics.total_cleaned > 0
+        ):
+            logger.info(
+                "Reconciliation complete: synced %s docs, %s message embeddings; failed %s docs, %s message embeddings; cleaned %s docs",
+                metrics.documents_synced,
+                metrics.message_embeddings_synced,
+                metrics.documents_failed,
+                metrics.message_embeddings_failed,
+                metrics.documents_cleaned,
+            )
+
+            # Emit telemetry event
+            emit(
+                SyncVectorsCompletedEvent(
+                    documents_synced=metrics.documents_synced,
+                    documents_failed=metrics.documents_failed,
+                    documents_cleaned=metrics.documents_cleaned,
+                    message_embeddings_synced=metrics.message_embeddings_synced,
+                    message_embeddings_failed=metrics.message_embeddings_failed,
+                    total_duration_ms=duration_ms,
+                )
+            )
+
+    elif reconciler_type == ReconcilerType.CLEANUP_QUEUE:
+        logger.debug("Processing cleanup_queue task")
+        await cleanup_queue_items()
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
+        # Emit telemetry event for cleanup stale items
+        emit(
+            CleanupStaleItemsCompletedEvent(
+                total_duration_ms=duration_ms,
+            )
+        )
+
+    else:
+        raise ValueError(f"Unsupported reconciler type: {reconciler_type}")

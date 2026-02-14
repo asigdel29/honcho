@@ -1,11 +1,12 @@
-# pyright: reportUnannotatedClassAttribute=false # pyright: ignore
 import datetime
 import ipaddress
-from typing import Annotated, Any, Self
+from enum import Enum
+from typing import Annotated, Any, Literal, Self, cast
 from urllib.parse import urlparse
 
 import tiktoken
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -14,7 +15,193 @@ from pydantic import (
     model_validator,
 )
 
+from src.config import ReasoningLevel, settings
+from src.utils.types import DocumentLevel
+
 RESOURCE_NAME_PATTERN = r"^[a-zA-Z0-9_-]+$"
+
+
+class DreamType(str, Enum):
+    """Types of dreams that can be triggered."""
+
+    OMNI = "omni"
+
+
+class ReconcilerType(str, Enum):
+    """Types of reconciler tasks that can be performed."""
+
+    SYNC_VECTORS = "sync_vectors"
+    CLEANUP_QUEUE = "cleanup_queue"
+
+
+class ReasoningConfiguration(BaseModel):
+    enabled: bool | None = Field(
+        default=None,
+        description="Whether to enable reasoning functionality.",
+    )
+    custom_instructions: str | None = Field(
+        default=None,
+        description="TODO: currently unused. Custom instructions to use for the reasoning system on this workspace/session/message.",
+    )
+
+
+class PeerCardConfiguration(BaseModel):
+    use: bool | None = Field(
+        default=None,
+        description="Whether to use peer card related to this peer during reasoning process.",
+    )
+    create: bool | None = Field(
+        default=None,
+        description="Whether to generate peer card based on content.",
+    )
+
+
+class SummaryConfiguration(BaseModel):
+    enabled: bool | None = Field(
+        default=None,
+        description="Whether to enable summary functionality.",
+    )
+    messages_per_short_summary: int | None = Field(
+        default=None,
+        ge=10,
+        description="Number of messages per short summary. Must be positive, greater than or equal to 10, and less than messages_per_long_summary.",
+    )
+    messages_per_long_summary: int | None = Field(
+        default=None,
+        ge=20,
+        description="Number of messages per long summary. Must be positive, greater than or equal to 20, and greater than messages_per_short_summary.",
+    )
+
+    @model_validator(mode="after")
+    def validate_summary_thresholds(self) -> Self:
+        """Validate that short summary threshold <= long summary threshold."""
+        short = self.messages_per_short_summary
+        long = self.messages_per_long_summary
+
+        if short is not None and long is not None and short >= long:
+            raise ValueError(
+                "messages_per_short_summary must be less than messages_per_long_summary"
+            )
+
+        return self
+
+
+class DreamConfiguration(BaseModel):
+    enabled: bool | None = Field(
+        default=None,
+        description="Whether to enable dream functionality. If reasoning is disabled, dreams will also be disabled and this setting will be ignored.",
+    )
+
+
+class WorkspaceConfiguration(BaseModel):
+    """
+    The set of options that can be in a workspace DB-level configuration dictionary.
+
+    All fields are optional. Session-level configuration overrides workspace-level configuration, which overrides global configuration.
+    """
+
+    model_config = ConfigDict(extra="allow")  # pyright: ignore
+
+    reasoning: ReasoningConfiguration | None = Field(
+        default=None,
+        description="Configuration for reasoning functionality.",
+    )
+    peer_card: PeerCardConfiguration | None = Field(
+        default=None,
+        description="Configuration for peer card functionality. If reasoning is disabled, peer cards will also be disabled and these settings will be ignored.",
+    )
+    summary: SummaryConfiguration | None = Field(
+        default=None,
+        description="Configuration for summary functionality.",
+    )
+    dream: DreamConfiguration | None = Field(
+        default=None,
+        description="Configuration for dream functionality. If reasoning is disabled, dreams will also be disabled and these settings will be ignored.",
+    )
+
+
+class SessionConfiguration(WorkspaceConfiguration):
+    """
+    The set of options that can be in a session DB-level configuration dictionary.
+
+    All fields are optional. Session-level configuration overrides workspace-level configuration, which overrides global configuration.
+    """
+
+    pass
+
+
+class MessageConfiguration(BaseModel):
+    """
+    The set of options that can be in a message DB-level configuration dictionary.
+
+    All fields are optional. Message-level configuration overrides all other configurations.
+    """
+
+    reasoning: ReasoningConfiguration | None = Field(
+        default=None,
+        description="Configuration for reasoning functionality.",
+    )
+
+
+class ResolvedReasoningConfiguration(BaseModel):
+    enabled: bool
+
+
+class ResolvedPeerCardConfiguration(BaseModel):
+    use: bool
+    create: bool
+
+
+class ResolvedSummaryConfiguration(BaseModel):
+    enabled: bool
+    messages_per_short_summary: int
+    messages_per_long_summary: int
+
+
+class ResolvedDreamConfiguration(BaseModel):
+    enabled: bool
+
+
+class ResolvedConfiguration(BaseModel):
+    """
+    The final resolved configuration for a given message.
+    Hierarchy: message > session > workspace > global configuration
+    """
+
+    reasoning: ResolvedReasoningConfiguration
+    peer_card: ResolvedPeerCardConfiguration
+    summary: ResolvedSummaryConfiguration
+    dream: ResolvedDreamConfiguration
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_deriver_to_reasoning(cls, data: Any) -> Any:
+        """Handle v3.0.0 migration: 'deriver' was renamed to 'reasoning'."""
+        if not isinstance(data, dict):
+            return data
+
+        config = cast(dict[str, Any], data)
+
+        if "deriver" in config and "reasoning" not in config:
+            config["reasoning"] = config.pop("deriver")
+
+        return config
+
+
+class PeerConfig(BaseModel):
+    # TODO: Update description - should say "Whether honcho forms a representation of the peer itself"
+    observe_me: bool | None = Field(
+        default=None,
+        description="Whether Honcho will use reasoning to form a representation of this peer",
+    )
+
+
+class SessionPeerConfig(PeerConfig):
+    # TODO: Update description - should say "Whether this peer forms representations of other peers in the session"
+    observe_others: bool | None = Field(
+        default=None,
+        description="Whether this peer should form a session-level theory-of-mind representation of other peers in the session",
+    )
 
 
 class WorkspaceBase(BaseModel):
@@ -27,7 +214,9 @@ class WorkspaceCreate(WorkspaceBase):
         Field(alias="id", min_length=1, max_length=100, pattern=RESOURCE_NAME_PATTERN),
     ]
     metadata: dict[str, Any] = {}
-    configuration: dict[str, Any] = {}
+    configuration: WorkspaceConfiguration = Field(
+        default_factory=WorkspaceConfiguration
+    )
 
     model_config = ConfigDict(populate_by_name=True)  # pyright: ignore
 
@@ -38,7 +227,7 @@ class WorkspaceGet(WorkspaceBase):
 
 class WorkspaceUpdate(WorkspaceBase):
     metadata: dict[str, Any] | None = None
-    configuration: dict[str, Any] | None = None
+    configuration: WorkspaceConfiguration | None = None
 
 
 class Workspace(WorkspaceBase):
@@ -93,20 +282,53 @@ class Peer(PeerBase):
 
 
 class PeerRepresentationGet(BaseModel):
-    session_id: str = Field(
-        ..., description="Get the working representation within this session"
+    session_id: str | None = Field(
+        None, description="Optional session ID within which to scope the representation"
     )
     target: str | None = Field(
         None,
         description="Optional peer ID to get the representation for, from the perspective of this peer",
     )
-
-
-class PeerConfig(BaseModel):
-    observe_me: bool = Field(
-        default=True,
-        description="Whether honcho should form a global theory-of-mind representation of this peer",
+    search_query: str | None = Field(
+        None,
+        description="Optional input to curate the representation around semantic search results",
     )
+    search_top_k: int | None = Field(
+        None,
+        ge=1,
+        le=100,
+        description="Only used if `search_query` is provided. Number of semantic-search-retrieved conclusions to include in the representation",
+    )
+    search_max_distance: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Only used if `search_query` is provided. Maximum distance to search for semantically relevant conclusions",
+    )
+    include_most_frequent: bool | None = Field(
+        default=None,
+        description="Only used if `search_query` is provided. Whether to include the most frequent conclusions in the representation",
+    )
+    max_conclusions: int | None = Field(
+        default=25,
+        ge=1,
+        le=100,
+        description="Only used if `search_query` is provided. Maximum number of conclusions to include in the representation",
+    )
+
+
+class RepresentationResponse(BaseModel):
+    representation: str
+
+
+class PeerCardResponse(BaseModel):
+    peer_card: list[str] | None = Field(
+        None, description="The peer card content, or None if not found"
+    )
+
+
+class PeerCardSet(BaseModel):
+    peer_card: list[str] = Field(..., description="The peer card content to set")
 
 
 class MessageBase(BaseModel):
@@ -114,9 +336,10 @@ class MessageBase(BaseModel):
 
 
 class MessageCreate(MessageBase):
-    content: Annotated[str, Field(min_length=0, max_length=50000)]
+    content: Annotated[str, Field(min_length=0, max_length=settings.MAX_MESSAGE_SIZE)]
     peer_name: str = Field(alias="peer_id")
     metadata: dict[str, Any] | None = None
+    configuration: MessageConfiguration | None = None
     created_at: datetime.datetime | None = None
 
     _encoded_message: list[int] = PrivateAttr(default=[])
@@ -127,7 +350,7 @@ class MessageCreate(MessageBase):
 
     @model_validator(mode="after")
     def validate_and_set_token_count(self) -> Self:
-        encoding = tiktoken.get_encoding("cl100k_base")
+        encoding = tiktoken.get_encoding("o200k_base")
         encoded_message = encoding.encode(self.content)
 
         self._encoded_message = encoded_message
@@ -169,23 +392,15 @@ class MessageUploadCreate(BaseModel):
     """Schema for message creation from file uploads"""
 
     peer_id: str = Field(..., description="ID of the peer creating the message")
+    metadata: dict[str, Any] | None = None
+    configuration: MessageConfiguration | None = None
+    created_at: datetime.datetime | None = None
 
     model_config = ConfigDict(populate_by_name=True)  # pyright: ignore
 
 
 class SessionBase(BaseModel):
     pass
-
-
-class SessionPeerConfig(BaseModel):
-    observe_others: bool = Field(
-        default=False,
-        description="Whether this peer should form a session-level theory-of-mind representation of other peers in the session",
-    )
-    observe_me: bool | None = Field(
-        default=None,
-        description="Whether other peers in this session should try to form a session-level theory-of-mind representation of this peer",
-    )
 
 
 class SessionCreate(SessionBase):
@@ -195,7 +410,7 @@ class SessionCreate(SessionBase):
     ]
     metadata: dict[str, Any] | None = None
     peer_names: dict[str, SessionPeerConfig] | None = Field(default=None, alias="peers")
-    configuration: dict[str, Any] | None = None
+    configuration: SessionConfiguration | None = None
 
     model_config = ConfigDict(populate_by_name=True)  # pyright: ignore
 
@@ -206,7 +421,7 @@ class SessionGet(SessionBase):
 
 class SessionUpdate(SessionBase):
     metadata: dict[str, Any] | None = None
-    configuration: dict[str, Any] | None = None
+    configuration: SessionConfiguration | None = None
 
 
 class Session(SessionBase):
@@ -227,7 +442,12 @@ class Session(SessionBase):
 class Summary(BaseModel):
     content: str = Field(description="The summary text")
     message_id: int = Field(
-        description="The ID of the message that this summary covers up to"
+        description="The internal ID of the message that this summary covers up to",
+        exclude=True,
+    )
+    message_public_id: str = Field(
+        description="The public ID of the message that this summary covers up to",
+        serialization_alias="message_id",
     )
     summary_type: str = Field(description="The type of summary (short or long)")
     created_at: str = Field(
@@ -242,9 +462,32 @@ class SessionContext(SessionBase):
     summary: Summary | None = Field(
         default=None, description="The summary if available"
     )
+    peer_representation: str | None = Field(
+        default=None,
+        description="A curated subset of a peer representation, if context is requested from a specific perspective",
+    )
+    peer_card: list[str] | None = Field(
+        default=None,
+        description="The peer card, if context is requested from a specific perspective",
+    )
 
     model_config = ConfigDict(  # pyright: ignore
         from_attributes=True, populate_by_name=True
+    )
+
+
+class PeerContext(BaseModel):
+    """Context for a peer, including representation and peer card."""
+
+    peer_id: str = Field(description="The ID of the peer")
+    target_id: str = Field(description="The ID of the target peer being observed")
+    representation: str | None = Field(
+        default=None,
+        description="A curated subset of the representation of the target peer from the observer's perspective",
+    )
+    peer_card: list[str] | None = Field(
+        default=None,
+        description="The peer card for the target peer from the observer's perspective",
     )
 
 
@@ -266,14 +509,180 @@ class DocumentBase(BaseModel):
     pass
 
 
+class DocumentMetadata(BaseModel):
+    message_ids: list[int] = Field(
+        description="The ID range(s) of the messages that this document was derived from. Acts as a link to the primary source of the document. Note that as a document gets deduplicated, additional ranges will be added, because the same document could be derived from completely separate message ranges."
+    )
+    message_created_at: str = Field(
+        description="The timestamp of the message that this document was derived from. Note that this is not the same as the created_at timestamp of the document. This timestamp is usually only saved with second-level precision."
+    )
+    source_ids: list[str] | None = Field(
+        default=None,
+        description="Document IDs of source documents for tree traversal -- required for deductive and inductive documents",
+    )
+    premises: list[str] | None = Field(
+        default=None,
+        description="Human-readable premise text for display -- only applicable for deductive documents",
+    )
+    sources: list[str] | None = Field(
+        default=None,
+        description="Human-readable source text for display -- only applicable for inductive documents",
+    )
+    pattern_type: str | None = Field(
+        default=None,
+        description="Type of pattern identified (preference, behavior, personality, tendency, correlation) -- only applicable for inductive documents",
+    )
+    confidence: str | None = Field(
+        default=None,
+        description="Confidence level (high, medium, low) -- only applicable for inductive documents",
+    )
+
+
 class DocumentCreate(DocumentBase):
     content: Annotated[str, Field(min_length=1, max_length=100000)]
-    metadata: dict[str, Any] = {}
+    session_name: str | None = Field(
+        default=None,
+        description="The session from which the document was derived (NULL for global observations)",
+    )
+    level: DocumentLevel = Field(
+        default="explicit",
+        description="The level of the document (explicit, deductive, inductive, or contradiction)",
+    )
+    times_derived: int = Field(
+        default=1,
+        ge=1,
+        description="The number of times that a semantic duplicate document to this one has been derived",
+    )
+    metadata: DocumentMetadata = Field()
+    embedding: list[float] = Field()
+    # Tree linkage field
+    source_ids: list[str] | None = Field(
+        default=None,
+        description="Document IDs of source/premise documents -- for deductive and inductive documents",
+    )
 
 
-class DocumentUpdate(DocumentBase):
-    content: Annotated[str, Field(min_length=1, max_length=100000)]
-    metadata: dict[str, Any] | None = None
+class ObservationInput(BaseModel):
+    """Validated observation input from LLM tool calls."""
+
+    content: str = Field(min_length=1)
+    level: DocumentLevel = "explicit"
+    source_ids: list[str] | None = None
+    premises: list[str] | None = None
+    sources: list[str] | None = None
+    pattern_type: (
+        Literal["preference", "behavior", "personality", "tendency", "correlation"]
+        | None
+    ) = None
+    confidence: Literal["high", "medium", "low"] | None = None
+
+    @model_validator(mode="after")
+    def validate_level_fields(self) -> Self:
+        """Validate that level-specific fields are present when required."""
+        if self.level == "deductive" and not self.source_ids:
+            raise ValueError(
+                "deductive observations require 'source_ids' field with document IDs of premises"
+            )
+        if self.level == "inductive" and not self.source_ids:
+            raise ValueError(
+                "inductive observations require 'source_ids' field with document IDs of sources"
+            )
+        if self.level == "contradiction" and (
+            not self.source_ids or len(self.source_ids) < 2
+        ):
+            raise ValueError(
+                "contradiction observations require 'source_ids' field with at least 2 IDs of contradicting observations"
+            )
+        return self
+
+
+class ConclusionGet(BaseModel):
+    """Schema for listing conclusions with optional filters."""
+
+    filters: dict[str, Any] | None = None
+
+
+class Conclusion(BaseModel):
+    """Conclusion response - external view of a document."""
+
+    id: str
+    content: str
+    observer: str = Field(
+        description="The peer who made the conclusion",
+        serialization_alias="observer_id",
+    )
+    observed: str = Field(
+        description="The peer the conclusion is about",
+        serialization_alias="observed_id",
+    )
+    session_name: str | None = Field(default=None, serialization_alias="session_id")
+    created_at: datetime.datetime
+
+    model_config = ConfigDict(  # pyright: ignore
+        from_attributes=True,
+        populate_by_name=True,
+    )
+
+
+class ConclusionQuery(BaseModel):
+    """Query parameters for semantic search of conclusions."""
+
+    query: str = Field(..., description="Semantic search query")
+    top_k: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Number of results to return",
+    )
+    distance: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Maximum cosine distance threshold for results",
+    )
+    filters: dict[str, Any] | None = Field(
+        default=None,
+        description="Additional filters to apply",
+    )
+
+
+class ConclusionCreate(BaseModel):
+    """Schema for creating a single conclusion."""
+
+    content: Annotated[str, Field(min_length=1, max_length=65535)]
+    observer_id: str = Field(..., description="The peer making the conclusion")
+    observed_id: str = Field(..., description="The peer the conclusion is about")
+    session_id: str | None = Field(
+        default=None,
+        description="A session ID to store the conclusion in, if specified",
+    )
+
+    _token_count: int = PrivateAttr(default=0)
+
+    @model_validator(mode="after")
+    def validate_token_count(self) -> Self:
+        """Validate that content doesn't exceed embedding token limit."""
+        encoding = tiktoken.get_encoding("o200k_base")
+        tokens = encoding.encode(self.content)
+        self._token_count = len(tokens)
+
+        if self._token_count > settings.MAX_EMBEDDING_TOKENS:
+            raise ValueError(
+                f"Content exceeds maximum embedding token limit of {settings.MAX_EMBEDDING_TOKENS} "
+                + f"(got {self._token_count} tokens)"
+            )
+        return self
+
+
+class ConclusionBatchCreate(BaseModel):
+    """Schema for batch conclusion creation with a max of 100 conclusions."""
+
+    conclusions: list[ConclusionCreate] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        validation_alias=AliasChoices("conclusions", "observations"),
+    )
 
 
 class MessageSearchOptions(BaseModel):
@@ -301,10 +710,31 @@ class DialecticOptions(BaseModel):
         str, Field(min_length=1, max_length=10000, description="Dialectic API Prompt")
     ]
     stream: bool = False
+    reasoning_level: ReasoningLevel = Field(
+        default="low",
+        description="Level of reasoning to apply: minimal, low, medium, high, or max",
+    )
 
 
 class DialecticResponse(BaseModel):
-    content: str
+    content: str | None
+
+
+class DialecticStreamDelta(BaseModel):
+    """Delta object for streaming dialectic responses."""
+
+    content: str | None = None
+    # Future fields can be added here:
+    # premises: str | None = None
+    # tokens: int | None = None
+    # analytics: dict[str, Any] | None = None
+
+
+class DialecticStreamChunk(BaseModel):
+    """Chunk in a streaming dialectic response."""
+
+    delta: DialecticStreamDelta
+    done: bool = False
 
 
 class SessionCounts(BaseModel):
@@ -339,14 +769,6 @@ class QueueStatusRow(BaseModel):
     session_pending: int
 
 
-class PeerConfigResult(BaseModel):
-    """Result from querying peer configuration data."""
-
-    peer_name: str
-    peer_configuration: dict[str, Any]
-    session_peer_configuration: dict[str, Any]
-
-
 class SessionPeerData(BaseModel):
     """Data for managing session peer relationships."""
 
@@ -361,9 +783,12 @@ class MessageBulkData(BaseModel):
     workspace_name: str
 
 
-class SessionDeriverStatus(BaseModel):
+class SessionQueueStatus(BaseModel):
+    """Status for a specific session within the processing queue."""
+
     session_id: str | None = Field(
-        default=None, description="Session ID if filtered by session"
+        default=None,
+        description="Session ID if filtered by session",
     )
     total_work_units: int = Field(description="Total work units")
     completed_work_units: int = Field(description="Completed work units")
@@ -373,15 +798,29 @@ class SessionDeriverStatus(BaseModel):
     pending_work_units: int = Field(description="Work units waiting to be processed")
 
 
-class DeriverStatus(BaseModel):
+class QueueStatus(BaseModel):
+    """Aggregated processing queue status."""
+
     total_work_units: int = Field(description="Total work units")
     completed_work_units: int = Field(description="Completed work units")
     in_progress_work_units: int = Field(
         description="Work units currently being processed"
     )
     pending_work_units: int = Field(description="Work units waiting to be processed")
-    sessions: dict[str, SessionDeriverStatus] | None = Field(
-        default=None, description="Per-session status when not filtered by session"
+    sessions: dict[str, SessionQueueStatus] | None = Field(
+        default=None,
+        description="Per-session status when not filtered by session",
+    )
+
+
+class ScheduleDreamRequest(BaseModel):
+    observer: str = Field(..., description="Observer peer name")
+    observed: str | None = Field(
+        None, description="Observed peer name (defaults to observer if not specified)"
+    )
+    dream_type: DreamType = Field(..., description="Type of dream to schedule")
+    session_id: str | None = Field(
+        None, description="Session ID to scope the dream to if specified"
     )
 
 

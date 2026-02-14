@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
-from honcho_core.types.workspaces.sessions.message import Message
-from pydantic import BaseModel, Field, validate_call
+from pydantic import BaseModel, ConfigDict, Field
+
+from .message import Message
 
 if TYPE_CHECKING:
     from .peer import Peer
@@ -13,7 +14,7 @@ class Summary(BaseModel):
     """Represents a summary of a session's conversation."""
 
     content: str = Field(..., description="The summary text")
-    message_id: int = Field(
+    message_id: str = Field(
         ..., description="The ID of the message that this summary covers up to"
     )
     summary_type: str = Field(..., description="The type of summary (short or long)")
@@ -49,6 +50,8 @@ class SessionContext(BaseModel):
         messages: List of Message objects representing the conversation context
     """
 
+    model_config: ClassVar[ConfigDict] = ConfigDict(arbitrary_types_allowed=True)
+
     session_id: str = Field(
         ..., description="ID of the session this context belongs to"
     )
@@ -58,33 +61,14 @@ class SessionContext(BaseModel):
     summary: Summary | None = Field(
         None, description="Summary of the session history prior to the message cutoff"
     )
-
-    @validate_call
-    def __init__(
-        self,
-        session_id: str = Field(
-            ..., description="ID of the session this context belongs to"
-        ),
-        messages: list[Message] = Field(
-            ..., description="List of Message objects to include in the context"
-        ),
-        summary: Summary | None = Field(
-            None,
-            description="Summary of the session history prior to the message cutoff",
-        ),
-    ) -> None:
-        """
-        Initialize a new SessionContext.
-
-        Args:
-            messages: List of Message objects to include in the context
-            summary: Optional Summary object containing summary information
-        """
-        super().__init__(
-            session_id=session_id,
-            messages=messages,
-            summary=summary,
-        )
+    peer_representation: str | None = Field(
+        None,
+        description="The peer representation, if context is requested from a specific perspective",
+    )
+    peer_card: list[str] | None = Field(
+        None,
+        description="The peer card, if context is requested from a specific perspective",
+    )
 
     def to_openai(
         self,
@@ -117,14 +101,30 @@ class SessionContext(BaseModel):
             }
             for message in self.messages
         ]
+        system_messages: list[dict[str, str]] = []
+
+        if self.peer_representation:
+            peer_representation_message = {
+                "role": "system",
+                "content": f"<peer_representation>{self.peer_representation}</peer_representation>",
+            }
+            system_messages.append(peer_representation_message)
+
+        if self.peer_card:
+            peer_card_message = {
+                "role": "system",
+                "content": f"<peer_card>{self.peer_card}</peer_card>",
+            }
+            system_messages.append(peer_card_message)
 
         if self.summary:
             summary_message = {
                 "role": "system",
                 "content": f"<summary>{self.summary.content}</summary>",
             }
-            return [summary_message, *messages]
-        return messages
+            system_messages.append(summary_message)
+
+        return system_messages + messages
 
     def to_anthropic(
         self,
@@ -164,14 +164,30 @@ class SessionContext(BaseModel):
             }
             for message in self.messages
         ]
+        system_messages: list[dict[str, str]] = []
+
+        if self.peer_representation:
+            peer_representation_message = {
+                "role": "user",
+                "content": f"<peer_representation>{self.peer_representation}</peer_representation>",
+            }
+            system_messages.append(peer_representation_message)
+
+        if self.peer_card:
+            peer_card_message = {
+                "role": "user",
+                "content": f"<peer_card>{self.peer_card}</peer_card>",
+            }
+            system_messages.append(peer_card_message)
 
         if self.summary:
             summary_message = {
                 "role": "user",
                 "content": f"<summary>{self.summary.content}</summary>",
             }
-            return [summary_message, *messages]
-        return messages
+            system_messages.append(summary_message)
+
+        return system_messages + messages
 
     def __len__(self) -> int:
         """

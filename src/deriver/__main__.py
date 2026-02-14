@@ -3,10 +3,20 @@ import logging
 import os
 
 import uvloop
+from prometheus_client import start_http_server
 
 from src.config import settings
+from src.telemetry import initialize_telemetry_async, shutdown_telemetry
 
 from .queue_manager import main
+
+logger = logging.getLogger(__name__)
+
+
+def start_metrics_server() -> None:
+    """Start the Prometheus metrics HTTP server on port 9090."""
+    start_http_server(9090)
+    logger.info("Prometheus metrics server started on port 9090")
 
 
 def setup_logging():
@@ -43,19 +53,33 @@ def setup_logging():
     logging.getLogger("groq._base_client").setLevel(logging.WARNING)
 
 
-if __name__ == "__main__":
-    print("[DERIVER] Starting deriver queue processor")
+async def run_deriver():
+    """Run the deriver with proper telemetry lifecycle management."""
+    # Initialize async telemetry (CloudEvents emitter)
+    await initialize_telemetry_async()
+    try:
+        await main()
+    finally:
+        # Shutdown telemetry (flush CloudEvents buffer)
+        await shutdown_telemetry()
 
+
+if __name__ == "__main__":
     # Setup logging before starting the main loop
     setup_logging()
+    logger.info("Starting deriver queue processor")
 
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     try:
-        print("[DERIVER] Running main loop")
-        asyncio.run(main())
+        # Start Prometheus metrics server if enabled
+        if settings.METRICS.ENABLED:
+            start_metrics_server()
+
+        logger.info("Running main loop")
+        asyncio.run(run_deriver())
     except KeyboardInterrupt:
-        print("[DERIVER] Shutdown initiated via KeyboardInterrupt")
+        logger.info("Shutdown initiated via KeyboardInterrupt")
     except Exception as e:
-        print(f"[DERIVER] Error in main process: {str(e)}")
+        logger.exception("Error in main process: %s", e)
     finally:
-        print("[DERIVER] Deriver process exiting")
+        logger.info("Deriver process exiting")

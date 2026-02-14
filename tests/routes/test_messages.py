@@ -24,7 +24,7 @@ async def test_create_message(
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -35,7 +35,7 @@ async def test_create_message(
             ]
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     message = data[0]
@@ -61,7 +61,7 @@ async def test_create_batch_messages_with_metadata(
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -77,7 +77,7 @@ async def test_create_batch_messages_with_metadata(
             ]
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 2
 
@@ -105,7 +105,7 @@ async def test_create_batch_messages_without_metadata(
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -115,7 +115,7 @@ async def test_create_batch_messages_without_metadata(
             ]
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     assert data[0]["content"] == "Message without metadata"
@@ -137,7 +137,7 @@ async def test_create_batch_messages_with_null_metadata(
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -148,7 +148,7 @@ async def test_create_batch_messages_with_null_metadata(
             ]
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     assert data[0]["content"] == "Message with null metadata"
@@ -173,12 +173,13 @@ async def test_get_messages(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={},
     )
     assert response.status_code == 200
@@ -211,12 +212,14 @@ async def test_get_messages_with_reverse(
         content="First message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     test_message2 = models.Message(
         session_name=test_session.name,
         content="Second message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=2,
     )
     db_session.add(test_message1)
     db_session.add(test_message2)
@@ -224,7 +227,7 @@ async def test_get_messages_with_reverse(
 
     # Test normal order
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={},
     )
     assert response.status_code == 200
@@ -232,7 +235,7 @@ async def test_get_messages_with_reverse(
 
     # Test reversed order
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list?reverse=true",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list?reverse=true",
         json={},
     )
     assert response.status_code == 200
@@ -266,12 +269,13 @@ async def test_get_messages_with_empty_filter(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={"filters": {}},
     )
     assert response.status_code == 200
@@ -299,12 +303,13 @@ async def test_get_messages_with_null_filter(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={"filters": None},
     )
     assert response.status_code == 200
@@ -332,12 +337,13 @@ async def test_get_messages_no_body(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list"
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list"
     )
     assert response.status_code == 200
     data = response.json()
@@ -364,6 +370,7 @@ async def test_get_filtered_messages(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"key": "value"},
+        seq_in_session=1,
     )
     test_message2 = models.Message(
         session_name=test_session.name,
@@ -371,13 +378,14 @@ async def test_get_filtered_messages(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"key": "value2"},
+        seq_in_session=2,
     )
     db_session.add(test_message)
     db_session.add(test_message2)
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={"filters": {"metadata": {"key": "value2"}}},
     )
     assert response.status_code == 200
@@ -410,6 +418,7 @@ async def test_get_filtered_messages_with_complex_filter(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"type": "question", "priority": "high", "category": "technical"},
+        seq_in_session=1,
     )
     test_message2 = models.Message(
         session_name=test_session.name,
@@ -417,6 +426,7 @@ async def test_get_filtered_messages_with_complex_filter(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"type": "answer", "priority": "high", "category": "technical"},
+        seq_in_session=2,
     )
     test_message3 = models.Message(
         session_name=test_session.name,
@@ -424,6 +434,7 @@ async def test_get_filtered_messages_with_complex_filter(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"type": "question", "priority": "low", "category": "general"},
+        seq_in_session=3,
     )
     db_session.add(test_message1)
     db_session.add(test_message2)
@@ -432,7 +443,7 @@ async def test_get_filtered_messages_with_complex_filter(
 
     # Test old-style filter (backward compatibility)
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={"filters": {"metadata": {"priority": "high", "category": "technical"}}},
     )
     assert response.status_code == 200
@@ -443,7 +454,7 @@ async def test_get_filtered_messages_with_complex_filter(
 
     # Test new-style filter with AND operator
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={
             "filters": {
                 "AND": [
@@ -460,7 +471,7 @@ async def test_get_filtered_messages_with_complex_filter(
 
     # Test OR filter to get high priority OR question type
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
         json={
             "filters": {
                 "OR": [
@@ -494,12 +505,13 @@ async def test_update_message(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.put(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
         json={"metadata": {"new_key": "new_value"}},
     )
     assert response.status_code == 200
@@ -526,6 +538,7 @@ async def test_update_message_with_complex_metadata(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
@@ -538,7 +551,7 @@ async def test_update_message_with_complex_metadata(
     }
 
     response = client.put(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
         json={"metadata": complex_metadata},
     )
     assert response.status_code == 200
@@ -568,19 +581,20 @@ async def test_update_message_empty_metadata(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"test_key": "test_value"},
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.put(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
         json={"metadata": None},
     )
     assert response.status_code == 200
 
     # now ensure that the metadata is not changed
     response = client.get(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}"
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}"
     )
     assert response.status_code == 200
     data = response.json()
@@ -607,12 +621,13 @@ async def test_update_message_with_empty_dict_metadata(
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
         h_metadata={"old_key": "old_value"},
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.put(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
         json={"metadata": {}},
     )
     assert response.status_code == 200
@@ -638,12 +653,13 @@ async def test_get_single_message(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
 
     response = client.get(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}"
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}"
     )
     assert response.status_code == 200
     data = response.json()
@@ -670,7 +686,7 @@ async def test_get_nonexistent_message(
 
     nonexistent_message_id = str(generate_nanoid())
     response = client.get(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{nonexistent_message_id}"
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{nonexistent_message_id}"
     )
     assert response.status_code == 404
 
@@ -691,7 +707,7 @@ async def test_update_nonexistent_message(
 
     nonexistent_message_id = str(generate_nanoid())
     response = client.put(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{nonexistent_message_id}",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{nonexistent_message_id}",
         json={"metadata": {"key": "value"}},
     )
     assert response.status_code == 404
@@ -706,7 +722,7 @@ async def test_create_messages_for_nonexistent_session(
 
     nonexistent_session_id = str(generate_nanoid())
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{nonexistent_session_id}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{nonexistent_session_id}/messages",
         json={
             "messages": [
                 {
@@ -716,8 +732,8 @@ async def test_create_messages_for_nonexistent_session(
             ]
         },
     )
-    # Should create the session and return 200 with the created message
-    assert response.status_code == 200
+    # Should create the session and return 201 with the created message
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     assert data[0]["content"] == "Test message"
@@ -735,7 +751,7 @@ async def test_get_messages_for_nonexistent_session(
 
     nonexistent_session_id = str(generate_nanoid())
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{nonexistent_session_id}/messages/list",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{nonexistent_session_id}/messages/list",
         json={},
     )
     # Should return 200 with empty results (session doesn't exist = no messages)
@@ -760,7 +776,7 @@ async def test_create_empty_batch_messages(
     await db_session.commit()
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={"messages": []},
     )
     # Should return 422 for validation error (empty list not allowed)
@@ -788,10 +804,10 @@ async def test_create_batch_messages_max_limit(
     ]
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={"messages": messages},
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 100
     assert data[0]["content"] == "Message 0"
@@ -817,7 +833,7 @@ async def test_get_messages_handles_crud_value_error(
         mock_get.side_effect = ValueError("Test CRUD error")
 
         response = client.post(
-            f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
+            f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/list",
             json={},
         )
 
@@ -844,7 +860,7 @@ async def test_get_message_handles_not_found(
         mock_get.return_value = None
 
         response = client.get(
-            f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/nonexistent"
+            f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/nonexistent"
         )
 
         # Should raise ResourceNotFoundException which gets converted to 404
@@ -870,6 +886,7 @@ async def test_update_message_handles_crud_value_error(
         content="Test message",
         workspace_name=test_workspace.name,
         peer_name=test_peer.name,
+        seq_in_session=1,
     )
     db_session.add(test_message)
     await db_session.commit()
@@ -879,7 +896,7 @@ async def test_update_message_handles_crud_value_error(
         mock_update.side_effect = ValueError("Test CRUD error")
 
         response = client.put(
-            f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
+            f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/{test_message.public_id}",
             json={"metadata": {"key": "value"}},
         )
 
@@ -915,7 +932,7 @@ async def test_create_messages_with_file_too_large(
         form_data = {"peer_id": test_peer.name}
 
         response = client.post(
-            f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/upload",
+            f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages/upload",
             files=files,
             data=form_data,
         )
@@ -944,7 +961,7 @@ async def test_create_message_with_timestamp(
     )
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -956,7 +973,7 @@ async def test_create_message_with_timestamp(
             ]
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     message = data[0]
@@ -988,7 +1005,7 @@ async def test_create_message_without_timestamp_uses_default(
     before_request = datetime.datetime.now(datetime.timezone.utc)
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -1003,7 +1020,7 @@ async def test_create_message_without_timestamp_uses_default(
     # Record time after request
     after_request = datetime.datetime.now(datetime.timezone.utc)
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     message = data[0]
@@ -1040,7 +1057,7 @@ async def test_create_batch_messages_with_mixed_timestamps(
     before_request = datetime.datetime.now(datetime.timezone.utc)
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -1066,7 +1083,7 @@ async def test_create_batch_messages_with_mixed_timestamps(
 
     after_request = datetime.datetime.now(datetime.timezone.utc)
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 3
 
@@ -1111,7 +1128,7 @@ async def test_create_message_with_null_timestamp(
     before_request = datetime.datetime.now(datetime.timezone.utc)
 
     response = client.post(
-        f"/v2/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
+        f"/v3/workspaces/{test_workspace.name}/sessions/{test_session.name}/messages",
         json={
             "messages": [
                 {
@@ -1126,7 +1143,7 @@ async def test_create_message_with_null_timestamp(
 
     after_request = datetime.datetime.now(datetime.timezone.utc)
 
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert len(data) == 1
     message = data[0]

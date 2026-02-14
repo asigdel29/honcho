@@ -5,16 +5,16 @@
   "main": ".pnp.js",
   "scripts": {
     "dev": "mint dev",
-    "openapi": "npx @mintlify/scraping openapi-file openapi.documented.yml -o api-reference/endpoint",
+    "openapi": "npx @mintlify/scraping openapi-file v3/openapi.json -o v3/api-reference/endpoint",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@mintlify/scraping": "^4.0.284",
+    "@mintlify/scraping": "^4.0.467",
     "honcho-ai": "^0.0.11"
   },
   "devDependencies": {
-    "mint": "^4.2.13"
+    "mint": "^4.2.204"
   }
 }

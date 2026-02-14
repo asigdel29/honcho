@@ -5,7 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
-## [1.4.0] - 2025-08-12
+## [2.0.1] - 2026-02-09
+
+### Added
+
+- `set_peer_card` method
+
+### Changed
+
+- `card` is now `get_card` with `card` kept for backwards compatibility and marked as deprecated
+
+## [2.0.0] - 2026-01-13
+
+### Added
+
+- `ConclusionScope` object for CRUD operations on conclusions (renamed from observations)
+- Representation configuration support
+
+### Changed
+
+- Observations renamed to Conclusions across the SDK
+- Major SDK refactoring and cleanup
+- Simplified method signatures throughout
+- Representation endpoints now return `string` instead of old Representation object
+
+### Removed
+
+- Standalone types module (now uses honcho-core types)
+- Representation object
+
+## [1.6.0] - 2025-12-03
+
+### Added
+
+- metadata and configuration fields to Workspace, Peer, Session, and Message objects
+- Session Clone methods
+- Peer level get_context method
+- `ObservationScope` object to perform CRUD operations on observations
+- Representation object for WorkingRepresentations
+
+### Changed
+
+- methods that take IDs, can all optionally take an object of the same type
+
+## [1.5.0] - 2025-10-09
+
+### Added
+
+- Delete workspace method
+
+### Changed
+
+- message_id of `Summary` model is a string nanoid
+- Get Context can return Peer Card & Peer Representation
+
+## [1.4.1] — 2025-10-01
+
+### Added
+
+- Get Peer Card method
+- Update Message metadata method
+- Session level deriver status methods
+- Delete session message
+
+### Fixed
+
+- Dialectic Stream returns Iterators
+- Type warnings
+
+### Changed
+
+- Pagination class to match core implementation
+
+## [1.4.0] — 2025-08-12
 
 ### Added
 

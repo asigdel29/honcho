@@ -109,6 +109,30 @@ class FileProcessingError(HonchoException):
     detail = "File processing error"
 
 
+@final
+class SurprisalError(HonchoException):
+    """Exception raised when surprisal sampling fails during a dream cycle."""
+
+    status_code = 500
+    detail = "Surprisal sampling failed"
+
+
+@final
+class SpecialistExecutionError(HonchoException):
+    """Exception raised when a specialist fails during dream orchestration."""
+
+    status_code = 500
+    detail = "Specialist execution failed"
+
+
+@final
+class VectorStoreError(HonchoException):
+    """Exception raised when a vector store operation fails."""
+
+    status_code = 500
+    detail = "Vector store operation failed"
+
+
 class LLMError(Exception):
     """Exception raised when an LLM call fails.
 

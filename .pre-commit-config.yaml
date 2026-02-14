@@ -65,9 +65,28 @@ repos:
       # Run main application tests
       - id: pytest-main
         name: pytest (main app)
-        entry: uv run pytest tests/
+        entry: uv run pytest -x tests/ --ignore=tests/alembic/
         language: system
         files: ^(src/|tests/).*\.py$
+        stages: [pre-push]
+        pass_filenames: false
+
+      # Run Alembic tests only when migrations change
+      - id: pytest-alembic
+        name: pytest (alembic migrations)
+        entry: uv run python scripts/run_alembic_tests.py
+        language: system
+        files: ^(migrations/versions/.*\.py|tests/alembic/.*\.py)$
+        stages: [pre-push]
+        pass_filenames: true
+        require_serial: true
+
+      # Ensure each alembic migration revision has a corresponding test file
+      - id: ensure-alembic-coverage
+        name: ensure alembic migration test coverage
+        entry: uv run python scripts/ensure_alembic_tests.py
+        language: system
+        files: ^(migrations/versions/.*\.py|tests/alembic/revisions/.*\.py)$
         stages: [pre-push]
         pass_filenames: false
 
@@ -80,10 +99,10 @@ repos:
         stages: [pre-push]
         pass_filenames: false
 
-      # TypeScript build/test with bun
+      # TypeScript build with bun (tests run via pytest)
       - id: typescript-check
-        name: TypeScript build and test
-        entry: bash -c 'if [ -f "sdks/typescript/package.json" ]; then cd sdks/typescript && bun run build && bun run test; fi'
+        name: TypeScript build
+        entry: bash -c 'if [ -f "sdks/typescript/package.json" ]; then cd sdks/typescript && bun run build; fi'
         language: system
         files: ^sdks/typescript/.*\.(js|ts|jsx|tsx|json)$
         stages: [pre-push]
